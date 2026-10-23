@@ -16,6 +16,7 @@ import atexit
 import json
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -59,8 +60,9 @@ class MCPClient:
 
     def _start(self):
         """Spawn the server and run the startup handshake."""
+        command = shutil.which(self._command) or self._command
         self._proc = subprocess.Popen(
-            [self._command, *self._args],
+            [command, *self._args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             env={**os.environ, **(self._env or {})},  # servers inherit the user env, config overrides
