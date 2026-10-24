@@ -1,7 +1,10 @@
-""" A read-only tool that fetches the text content of a URL"""
-from urllib import request, error
+"""A read-only tool that fetches the text content of a URL."""
+
+from typing import ClassVar
+from urllib import request
 
 from .base import Tool
+
 
 class FetchUrlTool(Tool):
 
@@ -12,7 +15,7 @@ class FetchUrlTool(Tool):
         "Use this to read documentation, API responses, or web pages."
     )
 
-    parameters = {
+    parameters: ClassVar[dict] = {
         "type": "object",
         "properties": {
             "url": {
@@ -36,7 +39,8 @@ class FetchUrlTool(Tool):
             with request.urlopen(req, timeout=timeout) as response:
                 raw = response.read(1_000_000) # 顶多读 1MB，别让一个巨页撑爆内存
                 text = raw.decode("utf-8", errors = "replace")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
+            # boundary: the agent gets an error string, not a traceback
             return f"Error fetching {url}: {e}"
 
         if len(text) > 8000:
