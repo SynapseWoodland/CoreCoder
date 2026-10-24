@@ -114,11 +114,13 @@ class Agent:
 
             try:
                 self._execute_round(resp, on_tool)
-            except KeyboardInterrupt:
-                # Ctrl+C mid-execution would leave the assistant tool_calls
-                # message without replies, poisoning the next request; backfill
+            finally:
+                # any escape from the round (Ctrl+C, a crashing on_tool or ask
+                # callback, a BaseException from a tool) would leave the
+                # assistant tool_calls message without replies and poison
+                # every later request, so the backfill is unconditional and
+                # idempotent: on a clean round it is a no-op
                 self._answer_pending_tool_calls(resp.tool_calls)
-                raise
 
             # compress if tool outputs are big
             self.context.maybe_compress(self.messages, self.llm)

@@ -5,7 +5,8 @@ Groups 1, 2, 4 and 5 pin that spec (finish_reason propagation, the truncation
 gate, backfilling every tool_call id, and not false-positiving on zero-arg
 tools). Groups 3 and 6-9 pin the P1 follow-ups the review turned up: an
 unparseable argument string must never reach a tool, and the stop must be
-visible to the REPL, to one-shot mode and to a sub-agent.
+visible to the REPL, to one-shot mode and to a sub-agent. Group 10 pins M1:
+any exception escaping a round must still leave every tool_call answered.
 """
 
 from types import SimpleNamespace
@@ -17,7 +18,9 @@ import pytest
 from corecoder.agent import Agent, TruncatedOutput
 from corecoder.demo import ScriptedLLM
 from corecoder.llm import LLM, LLMResponse, ToolCall
+from corecoder.permissions import Permission
 from corecoder.tools.base import Tool
+from corecoder.tools.write import WriteFileTool
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -427,3 +430,121 @@ class TestRoundCapTruncation:
         # failed: returning the max-rounds string would exit 0 in one-shot mode
         with pytest.raises(TruncatedOutput):
             agent.chat("go")
+
+
+# ─── 10. M1: an escaping exception must not tear the history ────────────────
+
+class ExitTool(Tool):
+    """A tool that dies with a BaseException subclass, like SystemExit."""
+
+    name = "exiter"
+    description = "raises SystemExit"
+    parameters: ClassVar[dict] = {"type": "object", "properties": {}}
+
+    def execute(self):
+        raise SystemExit(3)
+
+
+class TestExceptionBackfill:
+    """Only Ctrl+C used to be backfilled. Every other escape (a crashing UI
+    callback, a crashing consent callback, a BaseException from a tool) left
+    an assistant tool_calls message without replies, so every later request
+    was rejected by the provider."""
+
+    def test_on_tool_callback_exception_backfills_then_raises(self):
+        spy = SpyTool()
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[ToolCall(id="t1", name="spy", arguments={})]),
+            ]),
+            tools=[spy],
+        )
+
+        def boom(name, arguments):
+            raise RuntimeError("UI callback crashed")
+
+        with pytest.raises(RuntimeError, match="UI callback crashed"):
+            agent.chat("go", on_tool=boom)
+
+        assert_tool_calls_answered(agent.messages)
+        replies = [(m["tool_call_id"], m["content"])
+                   for m in agent.messages if m.get("role") == "tool"]
+        assert replies == [("t1", "[interrupted]")]
+        # the callback crashed before the tool ran, so nothing executed
+        assert spy.calls == []
+
+    def test_permission_ask_exception_backfills_then_raises(self, tmp_path):
+        target = tmp_path / "a.txt"
+
+        def raiser(name, arguments):
+            raise PermissionError("consent callback crashed")
+
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[ToolCall(
+                    id="t1", name="write_file",
+                    arguments={"file_path": str(target), "content": "x\n"},
+                )]),
+            ]),
+            tools=[WriteFileTool()],
+            permission=Permission(ask=raiser),
+        )
+
+        with pytest.raises(PermissionError):
+            agent.chat("go")
+
+        assert_tool_calls_answered(agent.messages)
+        replies = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+        assert replies == ["[interrupted]"]
+        assert not target.exists()
+
+    def test_tool_baseexception_backfills_then_raises(self):
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[ToolCall(id="t1", name="exiter", arguments={})]),
+            ]),
+            tools=[ExitTool()],
+        )
+
+        with pytest.raises(SystemExit):
+            agent.chat("go")
+
+        assert_tool_calls_answered(agent.messages)
+        replies = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+        assert replies == ["[interrupted]"]
+
+    def test_parallel_worker_exception_backfills_whole_batch(self):
+        spy = SpyTool()
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[
+                    ToolCall(id="t1", name="spy", arguments={}),
+                    ToolCall(id="t2", name="exiter", arguments={}),
+                ]),
+            ]),
+            tools=[spy, ExitTool()],
+        )
+
+        with pytest.raises(SystemExit):
+            agent.chat("go")
+
+        # the sibling of the crashed call must be answered too
+        assert_tool_calls_answered(agent.messages)
+
+    def test_success_path_backfill_is_noop(self):
+        spy = SpyTool()
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[ToolCall(id="t1", name="spy", arguments={})]),
+                LLMResponse(content="done"),
+            ]),
+            tools=[spy],
+        )
+
+        assert agent.chat("go") == "done"
+
+        # the backfill must not duplicate the reply the round already wrote
+        assert len(spy.calls) == 1
+        replies = [(m["tool_call_id"], m["content"])
+                   for m in agent.messages if m.get("role") == "tool"]
+        assert replies == [("t1", "executed")]
