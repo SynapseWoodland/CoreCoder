@@ -54,6 +54,9 @@ class Agent:
         self.session_id = session_id or new_session_id()
         self.tracer = tracer if tracer is not None else create_tracer()
         self._root_span = None
+        # call ids whose refusal quotes raw streamed JSON; content capture
+        # shows a placeholder for these instead of copying it into the trace
+        self._trace_withheld: set[str] = set()
         self.tools = tools if tools is not None else ALL_TOOLS
         self.permission = permission
         self.hooks = hooks
@@ -85,6 +88,21 @@ class Agent:
             if rendered:
                 system += "\n\n# Current task list\n" + rendered
         return [{"role": "system", "content": system}] + self.messages
+
+    def _trace_messages(self) -> list[dict]:
+        """History for content capture, with bad-argument refusals withheld.
+
+        The refusal quotes the raw streamed JSON so the model can repair it;
+        the trace must not become a second copy of that text.
+        """
+        if not self._trace_withheld:
+            return self._full_messages()
+        return [
+            {**m, "content": "[bad arguments withheld from trace]"}
+            if m.get("role") == "tool" and m.get("tool_call_id") in self._trace_withheld
+            else m
+            for m in self._full_messages()
+        ]
 
     def _tool_schemas(self) -> list[dict]:
         return [t.schema() for t in self.tools]
@@ -141,7 +159,7 @@ class Agent:
                     estimated_prompt=estimated_prompt,
                 ) as llm_span:
                     if self.tracer.capture_content:
-                        llm_span.update(input=self._full_messages())
+                        llm_span.update(input=self._trace_messages())
                     try:
                         resp = self.llm.chat(
                             messages=self._full_messages(),
@@ -454,13 +472,17 @@ class Agent:
                 args_chars=self._args_chars(tc),
             )
         trace_fields = dict(fields, decision=decision, tool=tc.name, call_id=tc.id)
+        if decision == "bad_arguments":
+            self._trace_withheld.add(tc.id)
         if self.tracer.capture_content:
             try:
                 trace_fields["input"] = _redact(
                     json.dumps(tc.arguments, ensure_ascii=False))
             except (TypeError, ValueError):
                 trace_fields["input"] = str(tc.arguments)
-            if result is not None:
+            if result is not None and decision != "bad_arguments":
+                # a bad_arguments refusal quotes the raw streamed JSON; the
+                # trace must not become a second copy of it
                 trace_fields["output"] = result
         span.end(**trace_fields)
 
@@ -475,10 +497,16 @@ class Agent:
         error = getattr(tc, "arguments_error", "")
         if not error:
             return None
-        shown = error if len(error) <= 200 else error[:200] + "..."
+        raw = getattr(tc, "raw_arguments", "") or error
+        # the tail is where a truncated JSON usually breaks (unterminated
+        # string, dangling brace), so a head-only excerpt hides the cause
+        if len(raw) <= 200:
+            shown = repr(raw)
+        else:
+            shown = f"{raw[:120]!r}... ({len(raw)} chars total) ...{raw[-80:]!r}"
         return (
             f"Error: bad arguments for {tc.name}: the arguments were cut off or "
-            f"are not a valid JSON object ({shown!r}); the call was NOT executed. "
+            f"are not a valid JSON object ({shown}); the call was NOT executed. "
             "Re-issue it with one complete, smaller JSON object."
         )
 

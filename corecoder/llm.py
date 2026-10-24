@@ -24,7 +24,8 @@ class ToolCall:
     id: str
     name: str
     arguments: dict
-    # the JSON exactly as streamed: kept for audit even when it is broken
+    # the JSON exactly as streamed: kept in memory only, for the refusal text
+    # (and optional trace); history is rebuilt from the parsed dict
     raw_arguments: str = ""
     # non-empty means the arguments were cut off or were not a JSON object;
     # the agent must refuse to execute such a call instead of running {}
