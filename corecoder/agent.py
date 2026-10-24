@@ -72,6 +72,7 @@ class Agent:
         self.messages.append({"role": "user", "content": user_input})
         self.context.maybe_compress(self.messages, self.llm)
 
+        truncated_rounds = 0  # M2 guard: consecutive truncation counter
         for _ in range(self.max_rounds):
             resp = self.llm.chat(
                 messages=self._full_messages(),
@@ -80,38 +81,29 @@ class Agent:
                 on_reasoning=on_reasoning,
             )
 
+            # M2: truncated response with tool_calls -> do NOT execute anything
+            if resp.finish_reason == "length" and resp.tool_calls:
+                truncated_rounds += 1
+                self._answer_truncated_tool_calls(resp)
+                if truncated_rounds >= 2:
+                    return ("(model output truncated twice; "
+                            "raise max_tokens or reduce the request)")
+                continue
+
             # no tool calls -> LLM is done, return text
             if not resp.tool_calls:
                 self.messages.append(resp.message)
                 return resp.content
+
+            # reset consecutive counter on a successful non-truncated round
+            truncated_rounds = 0
 
             # tool calls -> execute (parallel when multiple, like Claude Code's
             # StreamingToolExecutor which runs independent tools concurrently)
             self.messages.append(resp.message)
 
             try:
-                if len(resp.tool_calls) == 1:
-                    tc = resp.tool_calls[0]
-                    if on_tool:
-                        on_tool(tc.name, tc.arguments)
-                    result = self._pre_hooks(tc) or self._permit(tc)
-                    if result is None:
-                        result = self._exec_tool(tc)
-                        self._post_hooks(tc, result)
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    })
-                else:
-                    # parallel execution for multiple tool calls
-                    results = self._exec_tools_parallel(resp.tool_calls, on_tool)
-                    for tc, result in zip(resp.tool_calls, results):
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result,
-                        })
+                self._execute_round(resp, on_tool)
             except KeyboardInterrupt:
                 # Ctrl+C mid-execution would leave the assistant tool_calls
                 # message without replies, poisoning the next request; backfill
@@ -122,6 +114,46 @@ class Agent:
             self.context.maybe_compress(self.messages, self.llm)
 
         return "(reached maximum tool-call rounds)"
+
+    def _answer_truncated_tool_calls(self, resp) -> None:
+        """M2: record a truncated response and reply to every tool call with a
+        re-issue hint, so nothing executes and the history stays valid."""
+        self.messages.append(resp.message)
+        for tc in resp.tool_calls:
+            self.messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": (
+                    "[truncated by max_tokens; re-issue the call "
+                    "with smaller arguments]"
+                ),
+            })
+
+    def _execute_round(self, resp, on_tool=None) -> None:
+        """Execute one tool-call round: single calls inline, multiple calls in
+        parallel, appending one tool reply per call to the history."""
+        if len(resp.tool_calls) == 1:
+            tc = resp.tool_calls[0]
+            if on_tool:
+                on_tool(tc.name, tc.arguments)
+            result = self._pre_hooks(tc) or self._permit(tc)
+            if result is None:
+                result = self._exec_tool(tc)
+                self._post_hooks(tc, result)
+            self.messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            })
+        else:
+            # parallel execution for multiple tool calls
+            results = self._exec_tools_parallel(resp.tool_calls, on_tool)
+            for tc, result in zip(resp.tool_calls, results):
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
 
     def _pre_hooks(self, tc) -> str | None:
         """PreToolUse hooks, fired before consent. A string return blocks the
