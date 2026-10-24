@@ -11,9 +11,10 @@ which means it's done working and ready to report back.
 
 import concurrent.futures
 import inspect
+import json
 
-from .context import ContextManager
-from .llm import LLM
+from .context import ContextManager, estimate_tokens
+from .llm import LLM, is_context_length_error
 from .permissions import Permission
 from .prompt import PLAN_MODE_PROMPT, system_prompt
 from .tools import ALL_TOOLS
@@ -74,19 +75,40 @@ class Agent:
     def _tool_schemas(self) -> list[dict]:
         return [t.schema() for t in self.tools]
 
+    def _fixed_prompt_tokens(self) -> int:
+        """Tokens every request carries that are not in `self.messages`."""
+        system = self._full_messages()[0]["content"]
+        return (estimate_tokens([{"role": "system", "content": system}])
+                + estimate_tokens([{"content": json.dumps(self._tool_schemas())}]))
+
     def chat(self, user_input: str, on_token=None, on_tool=None, on_reasoning=None) -> str:
         """Process one user message. May involve multiple LLM/tool rounds."""
         self.messages.append({"role": "user", "content": user_input})
-        self.context.maybe_compress(self.messages, self.llm)
+        self.context.maybe_compress(
+            self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
 
         truncated_rounds = 0  # M2 guard: consecutive truncation counter
         for _ in range(self.max_rounds):
-            resp = self.llm.chat(
-                messages=self._full_messages(),
-                tools=self._tool_schemas(),
-                on_token=on_token,
-                on_reasoning=on_reasoning,
-            )
+            try:
+                resp = self.llm.chat(
+                    messages=self._full_messages(),
+                    tools=self._tool_schemas(),
+                    on_token=on_token,
+                    on_reasoning=on_reasoning,
+                )
+            except Exception as e:
+                # provider tokenizers and our estimate never agree exactly, so a
+                # rejection is the last line of defence: collapse once and
+                # re-issue. A too-short history cannot free enough to help.
+                if not is_context_length_error(e) or len(self.messages) <= 4:
+                    raise
+                self.context.force_collapse(self.messages, self.llm)
+                resp = self.llm.chat(
+                    messages=self._full_messages(),
+                    tools=self._tool_schemas(),
+                    on_token=on_token,
+                    on_reasoning=on_reasoning,
+                )
 
             # M2: truncated response with tool_calls -> do NOT execute anything
             if resp.finish_reason == "length" and resp.tool_calls:
@@ -123,7 +145,8 @@ class Agent:
                 self._answer_pending_tool_calls(resp.tool_calls)
 
             # compress if tool outputs are big
-            self.context.maybe_compress(self.messages, self.llm)
+            self.context.maybe_compress(
+                self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
 
         if truncated_rounds:
             # the cap ran out on a truncated round, so no re-issue ever

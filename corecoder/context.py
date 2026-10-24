@@ -53,20 +53,26 @@ class ContextManager:
         self._summarize_at = int(max_tokens * 0.70)  # 70% -> LLM summarize
         self._collapse_at = int(max_tokens * 0.90)   # 90% -> hard collapse
 
-    def maybe_compress(self, messages: list[dict], llm: LLM | None = None) -> bool:
-        """Apply compression layers as needed. Returns True if any compression happened."""
-        current = estimate_tokens(messages)
+    def maybe_compress(self, messages: list[dict], llm: LLM | None = None,
+                       fixed_tokens: int = 0) -> bool:
+        """Apply compression layers as needed. Returns True if any compression happened.
+
+        `fixed_tokens` is the per-request overhead that lives outside
+        `messages` (system prompt, plan/todo block and tool schemas). Counting
+        it makes the 90% threshold describe the real request.
+        """
+        current = estimate_tokens(messages) + fixed_tokens
         compressed = False
 
         # Layer 1: snip verbose tool outputs
         if current > self._snip_at and self._snip_tool_outputs(messages):
             compressed = True
-            current = estimate_tokens(messages)
+            current = estimate_tokens(messages) + fixed_tokens
 
         # Layer 2: LLM-powered summarization of old turns
         if current > self._summarize_at and len(messages) > 10 and self._summarize_old(messages, llm, keep_recent=8):
             compressed = True
-            current = estimate_tokens(messages)
+            current = estimate_tokens(messages) + fixed_tokens
 
         # Layer 3: hard collapse - last resort
         if current > self._collapse_at and len(messages) > 4:
@@ -74,6 +80,10 @@ class ContextManager:
             compressed = True
 
         return compressed
+
+    def force_collapse(self, messages: list[dict], llm: LLM | None = None) -> None:
+        """Last-resort compaction after the provider rejects a request."""
+        self._hard_collapse(messages, llm)
 
     @staticmethod
     def _snip_tool_outputs(messages: list[dict]) -> bool:

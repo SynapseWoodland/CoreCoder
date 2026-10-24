@@ -105,6 +105,20 @@ def _load_pricing() -> dict:
     return pricing
 
 
+_CONTEXT_ERROR_HINTS = (
+    "maximum context length",
+    "context_length_exceeded",
+    "reduce the length of the messages",
+    "too many tokens",
+)
+
+
+def is_context_length_error(exc: BaseException) -> bool:
+    """True when a provider 400 says the request was too large for its window."""
+    message = str(exc).lower()
+    return any(hint in message for hint in _CONTEXT_ERROR_HINTS)
+
+
 def _adapt_rejected_param(params: dict, exc: BadRequestError) -> bool:
     """Translate or drop one parameter a provider rejected with a 400.
 

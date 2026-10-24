@@ -7,6 +7,8 @@ tools). Groups 3 and 6-9 pin the P1 follow-ups the review turned up: an
 unparseable argument string must never reach a tool, and the stop must be
 visible to the REPL, to one-shot mode and to a sub-agent. Group 10 pins M1:
 any exception escaping a round must still leave every tool_call answered.
+Group 11 pins M3: a provider context-length 400 collapses the history once
+and retries once, and the local estimate counts the fixed request overhead.
 """
 
 from types import SimpleNamespace
@@ -14,8 +16,10 @@ from typing import ClassVar
 from unittest import mock
 
 import pytest
+from openai import BadRequestError
 
 from corecoder.agent import Agent, TruncatedOutput
+from corecoder.context import ContextManager
 from corecoder.demo import ScriptedLLM
 from corecoder.llm import LLM, LLMResponse, ToolCall
 from corecoder.permissions import Permission
@@ -548,3 +552,130 @@ class TestExceptionBackfill:
         replies = [(m["tool_call_id"], m["content"])
                    for m in agent.messages if m.get("role") == "tool"]
         assert replies == [("t1", "executed")]
+
+
+# ─── 11. M3: context-length rejection collapses once, retries once ──────────
+
+def _bad_request(message: str) -> BadRequestError:
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        # openai>=3.14 moved its HTTP layer from httpx to httpx2
+        import httpx2 as httpx
+
+    req = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    return BadRequestError(message, response=httpx.Response(400, request=req), body=None)
+
+
+class CountingLLM:
+    """Minimal LLM double: counts calls, raises failures, then returns a reply."""
+
+    model = "fake"
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    estimated_cost = None
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def chat(self, messages, tools=None, on_token=None, on_reasoning=None):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class TestContextOverflowRecovery:
+    """`maybe_compress` only measured `self.messages`, so the system prompt and
+    tool schemas could push a 90%-full request over the window. When the
+    provider rejects it anyway, the loop must collapse once and retry once."""
+
+    @staticmethod
+    def _agent(llm, history: int = 6, **kwargs) -> Agent:
+        agent = Agent(llm=llm, tools=[], max_context_tokens=200_000, **kwargs)
+        agent.messages = [{"role": "user", "content": f"m{i}"} for i in range(history)]
+        return agent
+
+    def test_context_overflow_triggers_force_collapse_and_retries(self):
+        llm = CountingLLM(
+            _bad_request("This model's maximum context length is 8192 tokens"),
+            LLMResponse(content="recovered"),
+        )
+        agent = self._agent(llm)
+
+        with mock.patch.object(agent.context, "_get_summary", return_value="summary"), \
+                mock.patch.object(agent.context, "_hard_collapse",
+                                  wraps=agent.context._hard_collapse) as collapse:
+            answer = agent.chat("go")
+
+        assert answer == "recovered"
+        assert collapse.call_count == 1
+        assert llm.calls == 2
+
+    def test_context_overflow_retries_exactly_once(self):
+        # the second message is upper-case: the predicate must be case-insensitive
+        llm = CountingLLM(
+            _bad_request("maximum context length exceeded"),
+            _bad_request("MAXIMUM CONTEXT LENGTH exceeded again"),
+        )
+        agent = self._agent(llm)
+
+        with mock.patch.object(agent.context, "_get_summary", return_value="summary"), \
+                mock.patch.object(agent.context, "_hard_collapse",
+                                  wraps=agent.context._hard_collapse) as collapse, \
+                pytest.raises(BadRequestError):
+            agent.chat("go")
+
+        assert collapse.call_count == 1
+        assert llm.calls == 2
+
+    def test_non_context_400_is_not_retried_at_agent_level(self):
+        llm = CountingLLM(_bad_request("Unsupported parameter: 'response_format'"))
+        agent = self._agent(llm)
+
+        with mock.patch.object(agent.context, "_hard_collapse",
+                               wraps=agent.context._hard_collapse) as collapse, \
+                pytest.raises(BadRequestError):
+            agent.chat("go")
+
+        assert collapse.call_count == 0
+        assert llm.calls == 1
+
+    def test_short_history_overflow_is_not_collapsed(self):
+        # 2 stored + the new user message = 3: collapsing cannot free enough
+        llm = CountingLLM(_bad_request("maximum context length is 8192 tokens"))
+        agent = self._agent(llm, history=2)
+
+        with mock.patch.object(agent.context, "_hard_collapse",
+                               wraps=agent.context._hard_collapse) as collapse, \
+                pytest.raises(BadRequestError):
+            agent.chat("go")
+
+        assert collapse.call_count == 0
+        assert llm.calls == 1
+
+    def test_compression_counts_fixed_overhead(self):
+        ctx = ContextManager(max_tokens=2000)
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "t1",
+             "content": "\n".join(["y" * 200] * 10)},
+        ]
+
+        # ~591 tokens on its own: under the 1000-token snip threshold
+        assert ctx.maybe_compress(messages, None) is False
+        # the fixed request overhead pushes it over
+        assert ctx.maybe_compress(messages, None, fixed_tokens=500) is True
+        assert "snipped" in messages[1]["content"]
+
+    def test_agent_counts_fixed_overhead_in_compression(self):
+        agent = Agent(llm=ScriptedLLM([LLMResponse(content="ok")]), tools=[SpyTool()])
+
+        with mock.patch.object(agent.context, "maybe_compress",
+                               return_value=False) as compress:
+            assert agent.chat("hi") == "ok"
+
+        assert compress.call_count == 1
+        assert compress.call_args.kwargs["fixed_tokens"] > 0

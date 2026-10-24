@@ -2,7 +2,7 @@
 
 - 审查对象：`corecoder/agent.py` 中 `Agent.chat()` 主循环（v1.0 写作时为第 70–124 行，v1.2 实测为第 77–138 行）及其直接依赖
 - 审查基线：当前工作区 `main` 分支；文中行号均为写作时实测值
-- 文档版本：v1.2（2026-10-24）。v1.0 为审查定稿；v1.1 为 M2 实施后的复核回写，新增 0.5 节与 4.f 节，并同步第 7、9、10 节；v1.2 为 M1 实施后的回写，把第 3、7、8 节的状态改为已实施，并同步实测测试数
+- 文档版本：v1.3（2026-10-24）。v1.0 为审查定稿；v1.1 为 M2 实施后的复核回写，新增 0.5 节与 4.f 节，并同步第 7、9、10 节；v1.2 为 M1 实施后的回写，把第 3、7、8 节的状态改为已实施，并同步实测测试数；v1.3 为 M3 实施后的回写，更新第 2、5、7、8 节与 4.f.2 的组表，并同步 10.2、10.5 的实测值
 - 读者：未参与前序讨论、需要直接实施改造的工程师
 - 路径约定：除特别说明外，所有路径相对仓库根目录 `D:\github\CoreCoder`
 
@@ -10,7 +10,9 @@
 >
 > v1.1 增补：M2 已按第 4 节实施。实施后追加了两轮生产级复核，判定出两项必须修的次生问题，均已并入代码并回写在 4.f；未实施的建议项与残留风险，按原有格式并入第 9 节。
 >
-> v1.2 增补：M1 已按第 3 节实施，采用 `try/finally` 无条件回填（幂等）。实施记录、组 10 的 5 条用例与实测结果回写在 3.c–3.e；第 7、8 节标为已实施，4.f.2 的测试数与组数同步为实测值。M3、M4 仍未实施。
+> v1.2 增补：M1 已按第 3 节实施，采用 `try/finally` 无条件回填（幂等）。实施记录、组 10 的 5 条用例与实测结果回写在 3.c–3.e；第 7、8 节标为已实施，4.f.2 的测试数与组数同步为实测值。
+>
+> v1.3 增补：M3 已按第 5 节实施（请求级兜底 + 固定开销计入估算）。实施记录、组 11 的 6 条用例与实测结果回写在 5.c–5.e；第 2、7、8 节标为已实施，4.f.2 的组表、10.2 的 grep 预期与 10.5 的行数同步为实测值。M4 仍未实施。
 
 ## 0. 与上一轮审查的对应关系
 
@@ -49,6 +51,7 @@
 - 无法从源码确定的事项集中在第 10 节，标注“待核实”并给出核实命令。
 - v1.1 例外：4.f 节描述的是已实施并已跑过全量测试的行为，其中的行号与测试数为 v1.1 当时实测值。
 - v1.2 例外：第 3 节（M1）同样已实施并跑过全量测试，3.c–3.e 中的代码、行号与命令结果为 v1.2 实测值，不再用“应”表述；第 5、6 节（M3、M4）仍是 v1.0 的“应”表述，实施时请按 10.5 重新定位行号。
+- v1.3 例外：第 5 节（M3）已实施并跑过全量测试与真实 provider 脚本，5.c–5.e 为 v1.3 实测值；5.a 保留 v1.0 的问题存档，其中行号是修复前位置。第 6 节（M4）仍是 v1.0 的“应”表述，实施时请按 10.5 重新定位行号。
 
 ### 0.5 v1.1 复核严重度分级与本文编号的关系
 
@@ -106,8 +109,8 @@ M2 实施完成后追加两轮生产级复核。复核按严重度分级给出�
 | 编号 | 问题名称 | 用户可见影响 | 严重度 | 优先级 | 涉及文件与行号 |
 |---|---|---|---|---|---|
 | M1（v1.2 已实施） | 异常回填覆盖面不足 | 一次非 Ctrl+C 失败后，后续每轮请求都可能被 API 拒绝，只能 `/reset` | 高 | P0 | 实施前：`agent.py:90-119,217-231`；现状：`agent.py:113-124,299-313`；`hooks.py:70-88`；`permissions.py:53`；`cli.py:320-332` |
-| M2 | 截断响应未识别 | 截断时工具被空参数调用（MCP 可能写坏数据），或模型反复收到“参数错误”而重试 | 高 | P0 | `llm.py:209-277`（解析在 `263-266`）；`agent.py:153-168`；`mcp.py:206-207` |
-| M3 | 上下文超限无兜底 | 长会话突然报 `maximum context length`，本轮失败且不会自动恢复 | 高 | P1 | `agent.py:73,76,122`；`context.py:28-45,52-54,142-157`；`llm.py:180-190` |
+| M2（v1.1 已实施） | 截断响应未识别 | 截断时工具被空参数调用（MCP 可能写坏数据），或模型反复收到“参数错误”而重试 | 高 | P0 | 实施前：`llm.py:209-277`（解析在 `263-266`）、`agent.py:153-168`、`mcp.py:206-207`；现状：`llm.py:38,235,250-252,319`；`agent.py:26,114-119,151-161` |
+| M3（v1.3 已实施） | 上下文超限无兜底 | 长会话突然报 `maximum context length`，本轮失败且不会自动恢复 | 高 | P1 | 实施前：`agent.py:73,76,122`、`context.py:28-45,52-54,142-157`、`llm.py:180-190`；现状：`llm.py:108-120`；`context.py:56-86,152`；`agent.py:78-82,84-107,149` |
 | M4 | 工具结果无统一治理 | 一次大输出挤爆上下文；密钥回显进入历史并可能被 `/save` 落盘 | 中高 | P1 | `agent.py:153-168`；`read.py:34-53`；`mcp.py:107-119` |
 
 > 严重度衡量“用户是否会拿到错误结果或丢失数据”；优先级衡量“本轮实施顺序”。M1/M2 为 P0，因为它们在默认参数下就可能发生，且后果是会话不可用或副作用错误。
@@ -554,7 +557,7 @@ M2 按 4.c 实施后，对同一批改动做了两轮生产级复核，判定出
 
 **连带修正 R4（并行覆盖真空）。** 组 1–7 全部是单条 `tool_call` 的轮次，走的都是 `_execute_round` 的 `len == 1` 分支，`_exec_tools_parallel` 里新增的短路表达式从未被任何用例执行过——新加的防线自己无人守着。补组 8 `TestParallelBatch`（`tests/test_agent_loop_hardening.py:378`）：同一轮混合一个合法调用与一个坏 JSON 调用，断言合法的执行、坏的不执行、pre/post hook 只对合法调用触发、tool 回复按 id 对齐。其中 `pre == ["good"]` 是关键断言——它把并行分支的短路与 `_exec_tool` 的第二道防线区分开，删掉前者用例即红。
 
-**回归测试与现状。** `tests/test_agent_loop_hardening.py` 现为 10 组（组 10 为 v1.2 追加的 M1 用例）：
+**回归测试与现状。** `tests/test_agent_loop_hardening.py` 现为 11 组（组 10 为 v1.2 追加的 M1 用例，组 11 为 v1.3 追加的 M3 用例）：
 
 | 组 | 位置（类定义起始行，v1.2 实测） | 覆盖 |
 |---|---|---|
@@ -567,11 +570,14 @@ M2 按 4.c 实施后，对同一批改动做了两轮生产级复核，判定出
 | 7 | `319` | R2：one-shot 退出非 0、REPL 存活、子 agent 不谎报完成 |
 | 8 | `378` | R4 并行混合批次 |
 | 9 | `419` | R5 `max_rounds=1` 下截断仍抛 |
-| 10 | `448` | M1（v1.2）：逃逸异常回填（`on_tool` 崩溃 / `ask` 崩溃 / 工具抛 `BaseException` / 并行整批 / 成功路径 no-op） |
+| 10 | `452` | M1（v1.2）：逃逸异常回填（`on_tool` 崩溃 / `ask` 崩溃 / 工具抛 `BaseException` / 并行整批 / 成功路径 no-op） |
+| 11 | `590` | M3（v1.3）：context 400 强制压缩并重试一次、第二次失败原样抛、非 context 400 不重试、短历史不压缩、固定开销计入 snip 阈值、agent 传参 |
 
-全量 `pytest -q` 为 **245 passed / 1 skipped**（v1.2 实测，含组 10 的 5 条；v1.1 记为 242 passed / 1 skipped，差额即本次新增用例）；改动文件 `ruff check` 通过。附录 A.2 的探针仍有效，但它只验证 M2 本体（截断轮不执行），不覆盖 R1/R2；复核 R1/R2 请直接跑上述用例。
+全量 `pytest -q` 为 **251 passed / 1 skipped**（v1.3 实测，含组 11 的 6 条；v1.2 记为 245 passed / 1 skipped，差额即本次新增用例）；改动文件 `ruff check` 通过。附录 A.2 的探针仍有效，但它只验证 M2 本体（截断轮不执行），不覆盖 R1/R2；复核 R1/R2 请直接跑上述用例。
 
 ## 5. M3 上下文超限无兜底
+
+> **状态（v1.3）：已实施。** 落点：`corecoder/llm.py:108-120`（`is_context_length_error`）、`corecoder/context.py:56-86`（`fixed_tokens` 与 `force_collapse`）、`corecoder/agent.py:78-82,84-107,149`（固定开销估算 + 请求级兜底）。用例组 11（6 条，`tests/test_agent_loop_hardening.py:590`）。实测：组 11 `6 passed`，全量 `251 passed / 1 skipped`，`ruff` 通过；真实 provider 脚本见 5.e。5.a 的问题行号是修复前存档，当前行号以本状态头与 5.c 为准。
 
 ### 5.a 问题现状
 
@@ -640,87 +646,46 @@ M2 按 4.c 实施后，对同一批改动做了两轮生产级复核，判定出
 
 ### 5.c 具体实施
 
-**最小可行改动（M3-min）。**
+**已实施内容（M3-min，v1.3 实测）。**
 
-1. `corecoder/context.py`
-   - `maybe_compress` 增加 `fixed_tokens: int = 0`，三处阈值比较都使用 `current + fixed_tokens`。
-   - 新增：
+1. `corecoder/llm.py:108-120`
+   - 新增 `_CONTEXT_ERROR_HINTS`（`maximum context length` / `context_length_exceeded` / `reduce the length of the messages` / `too many tokens`）与 `is_context_length_error(exc) -> bool`，`str(exc).lower()` 后做包含匹配，大小写不敏感，同时覆盖 OpenAI SDK 与 LiteLLM 的异常类型。
 
-```python
-def force_collapse(self, messages: list[dict], llm=None) -> None:
-    """Public last-resort compaction, used when the provider rejects a request."""
-    self._hard_collapse(messages, llm)
-```
+2. `corecoder/context.py:56-86`
+   - `maybe_compress(self, messages, llm=None, fixed_tokens: int = 0)`：`current = estimate_tokens(messages) + fixed_tokens`，每次压缩后重算时同样加 `fixed_tokens`。
+   - 新增 `force_collapse(self, messages, llm=None)`，直接调用现有 `_hard_collapse`（`context.py:152`），复用 `_safe_split`，不会产生孤儿 tool 消息。
 
-2. `corecoder/llm.py`
+3. `corecoder/agent.py:78-82,84-107,149`
+   - 新增 `_fixed_prompt_tokens()`：`_full_messages()[0]["content"]` 的估算 + `json.dumps(self._tool_schemas())` 的估算，即固定开销。
+   - 两处 `maybe_compress` 调用（`agent.py:87-88,148-149`）都传 `fixed_tokens=self._fixed_prompt_tokens()`。
+   - 第一次 `llm.chat`（`agent.py:93-106`）包 `try/except Exception`：仅当 `is_context_length_error(e)` 且 `len(self.messages) > 4` 时 `force_collapse`，再用**重新生成的** `_full_messages()` 与 `_tool_schemas()` 重试一次；其余异常与第二次失败都原样抛出。捕获 `Exception` 而非 `BadRequestError`，是为了同时覆盖两条后端；`KeyboardInterrupt` 属于 `BaseException`，不会被吞。
 
-```python
-_CONTEXT_ERROR_HINTS = (
-    "maximum context length",
-    "context_length_exceeded",
-    "reduce the length of the messages",
-    "too many tokens",
-)
+**关键实现细节。**
 
-def is_context_length_error(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    return any(hint in message for hint in _CONTEXT_ERROR_HINTS)
-```
+- 重试时必须重新调用 `_full_messages()`：压缩改写了 `self.messages`，复用压缩前的列表会发出旧历史。
+- `len(self.messages) <= 4` 直接抛：历史太短时 `_hard_collapse` 无内容可丢，重试必然同样失败。
+- 只重试一次，不做循环；`_answer_pending_tool_calls` 与 `cli.py` 的 `/compact` 均未改动。`/compact` 仍按旧估算（不计固定开销），作为残留限制记录在此。
 
-3. `corecoder/agent.py`
-   - `agent.py` 目前没有 `import json`，需要补上。
-   - 计算固定开销并传给 `maybe_compress`：
+**向后兼容。** `fixed_tokens` 默认 0，旧调用行为不变；`force_collapse` 是新增公共方法，不改变既有签名。
 
-```python
-def _fixed_prompt_tokens(self) -> int:
-    system = self._full_messages()[0]["content"]  # 已含 plan/todo
-    return (estimate_tokens([{"role": "system", "content": system}])
-            + estimate_tokens([{"content": json.dumps(self._tool_schemas())}]))
-```
+**回滚点。** `git revert <M3 commit>`，同时回滚 `corecoder/llm.py`、`corecoder/context.py`、`corecoder/agent.py`、组 11 与 `examples/m3_context_overflow.py`。
 
-   - 在 `76` 处：
-
-```python
-try:
-    resp = self.llm.chat(messages=..., tools=..., on_token=..., on_reasoning=...)
-except Exception as e:  # 不用只捕获 BadRequestError：LiteLLM 抛的是自己的异常类型
-    if not is_context_length_error(e) or len(self.messages) <= 4:
-        raise
-    self.context.force_collapse(self.messages, self.llm)
-    resp = self.llm.chat(messages=self._full_messages(), tools=self._tool_schemas(),
-                         on_token=on_token, on_reasoning=on_reasoning)
-```
-
-注意：
-
-- 只重试一次；第二次失败原样抛出。
-- `len(self.messages) <= 4` 时直接抛，避免“压缩后仍超限”的死循环。
-- `_full_messages()` 在压缩后必须重新调用，不能复用压缩前的列表。
-- 捕获 `Exception` 而不是 `BadRequestError`：OpenAI 后端抛 `BadRequestError`，LiteLLM 后端抛自己的异常类型（`llm.py:326-349`）；用消息谓词判定，才能同时覆盖两条后端。`KeyboardInterrupt` 属于 `BaseException`，不会被这里吞掉。
-
-**异常与回滚。** 新增的捕获只对“消息命中 context-length 谓词”的异常生效，其余异常原样重抛；`force_collapse` 复用 `_safe_split`，不会产生孤儿 tool 消息。回滚 revert 三个文件。
-
-**向后兼容。** `fixed_tokens` 默认 0，旧调用行为不变；新增函数与方法是追加，不改变既有签名。
-
-**验收标准。** 模拟 400 后第二次成功；只压缩一次、只重试一次；非 context 400 不触发压缩。
-
-**完整生产化改动（M3-full）。**
-
-- `ContextManager.measure_request()` 返回 messages/system/tools 三段明细，便于日志与调试。
-- `llm.chat` 识别 context-length 后不再白丢 `stream_options`，省一次往返。
-- 压缩前后记录 token 数与消息数，接入后续可观测性。
+**未纳入 M3-full。** `ContextManager.measure_request()` 三段明细、provider 400 后不再白丢 `stream_options`、压缩前后 token 计数接入日志，均属可观测性/省一次往返，本轮不做（见第 9 节）。
 
 ### 5.d 测试方案
 
-| 用例名 | 构造与失败注入 | 断言点 |
-|---|---|---|
-| `test_context_overflow_triggers_force_collapse_and_retries` | fake LLM 第一次抛带 `maximum context length` 的 `BadRequestError`，第二次返回文本 | 返回文本；`force_collapse` 调用 1 次；`chat` 调用 2 次 |
-| `test_context_overflow_retries_exactly_once` | 两次都抛 context 400 | 第二次异常向外抛；`force_collapse` 只调用 1 次 |
-| `test_non_context_400_is_not_retried_at_agent_level` | 抛 `BadRequestError("Unsupported parameter: 'response_format'")` | 直接抛；`force_collapse` 未调用 |
-| `test_short_history_overflow_is_not_collapsed` | `messages` 长度 ≤ 4，抛 context 400 | 直接抛；未压缩 |
-| `test_compression_counts_fixed_overhead` | `ContextManager(max_tokens=...)`，构造刚好低于阈值的历史，`fixed_tokens` 推过阈值 | snip 被触发，tool 内容变短 |
+组 11 `TestContextOverflowRecovery`（`tests/test_agent_loop_hardening.py:590`）共 6 条。构造 `BadRequestError` 的辅助函数沿用了 `tests/test_core.py` 的 `httpx`/`httpx2` 二选一写法；fake LLM 记录 `chat` 次数，`_get_summary` 用 `mock.patch.object(..., return_value="summary")` 隔离摘要请求，压缩计数用 `mock.patch.object(agent.context, "_hard_collapse", wraps=...)`（不依赖 `force_collapse` 是否存在，确保先红时失败原因是行为而不是 `AttributeError`）。
 
-构造 `BadRequestError` 的方式参考 `tests/test_core.py:533-543`（需要 `httpx` 或 `httpx2`，按当前环境选择）。
+| # | 用例名 | 构造与失败注入 | 断言点 | 先红时的实际失败原因 |
+|---|---|---|---|---|
+| 1 | `test_context_overflow_triggers_force_collapse_and_retries` | 第 1 次抛 context 400，第 2 次返回 `"recovered"` | 返回 `"recovered"`；`_hard_collapse` 1 次；`llm.calls == 2` | `BadRequestError: maximum context length` 直接冒出（无兜底） |
+| 2 | `test_context_overflow_retries_exactly_once` | 两次都抛 context 400，其中一条用大写 `MAXIMUM CONTEXT LENGTH` | 第二次异常外抛；`_hard_collapse` 1 次；`llm.calls == 2` | 异常在第一次就冒出（`calls == 1`、collapse 0） |
+| 3 | `test_non_context_400_is_not_retried_at_agent_level` | `BadRequestError("Unsupported parameter: 'response_format'")` | 直接抛；`_hard_collapse` 0 次；`llm.calls == 1` | 已绿（回归护栏） |
+| 4 | `test_short_history_overflow_is_not_collapsed` | 预置 2 条消息（chat 后 3 条 ≤ 4），抛 context 400 | 直接抛；`_hard_collapse` 0 次 | 已绿（回归护栏） |
+| 5 | `test_compression_counts_fixed_overhead` | `ContextManager(max_tokens=2000)`，一条 10 行 × 200 字符的 tool 消息（约 591 tokens，低于 snip 阈值） | 无 `fixed_tokens` 时 `maybe_compress` 返回 `False`；`fixed_tokens=500` 时返回 `True` 且 tool 内容出现 `snipped` | `TypeError: unexpected keyword argument 'fixed_tokens'` |
+| 6 | `test_agent_counts_fixed_overhead_in_compression` | `Agent(llm=ScriptedLLM([...]), tools=[SpyTool()])`，patch `agent.context.maybe_compress` | 调用参数 `kwargs["fixed_tokens"] > 0` | `KeyError: 'fixed_tokens'`（agent 未传） |
+
+**先红实测（v1.3）：4 红 2 绿**——#1、#2、#5、#6 因上表原因失败，#3、#4 作为回归护栏一开始就是绿的。
 
 运行：
 
@@ -728,32 +693,46 @@ except Exception as e:  # 不用只捕获 BadRequestError：LiteLLM 抛的是自
 .venv\Scripts\python.exe -m pytest tests/test_agent_loop_hardening.py -k "context or fixed_overhead" -v
 ```
 
+**先绿实测（v1.3）**：`6 passed, 20 deselected`；随后全量 `251 passed, 1 skipped`（24.27s），`ruff check corecoder tests` 输出 `All checks passed!`。
+
 ### 5.e 人工验证
 
-前置条件：同 M1，不需要 API key。
+离线探针仍保留在附录 A.3（不依赖 API key）。v1.3 增加了真实 provider 脚本 `examples/m3_context_overflow.py`（已用 `git add -f` 入库，`.gitignore` 规则保持不变），它用真实的 system prompt 与 tool schema 作为固定开销，历史首条约 1.45M 估算 token。
 
-步骤（cmd）：
+真实运行（仓库根目录，显式加载 `.env` 的 `OPENAI_API_KEY` / `CORECODER_MODEL`）：
 
-1. `cd /d D:\github\CoreCoder`
-2. 创建 `%TEMP%\cc_m3_probe.py`，内容见附录 A.3。
-3. `.venv\Scripts\python.exe "%TEMP%\cc_m3_probe.py"`
-
-预期输出（修复后）：
-
-```text
-chat calls: 2
-collapse calls: 1
-answer: recovered
+```bat
+.venv\Scripts\python.exe examples\m3_context_overflow.py
+.venv\Scripts\python.exe examples\m3_context_overflow.py --inject-400
 ```
 
-失败注入：
+**实测 1（不注入，真实 provider）**：本机 provider（`mimo-v2.6-flash`，`https://api.xiaomimimo.com/v1`）**接受了 1,455,907 估算 token 的请求并正常回答**，未触发 400，脚本按设计退出 2 并提示改用注入：
 
-- 把 fake LLM 的异常消息改成 `"Unsupported parameter: 'response_format'"` 再跑，应看到 `chat calls: 1` 且异常直接抛出，`collapse calls: 0`。
-- 把历史长度改到 4 条以内再跑，应直接抛出，`collapse calls: 0`。
+```text
+fixed prompt tokens (system + tool schemas): 2092
+history tokens (before the new prompt): 1455907
+context rejection: False
+collapse calls: 0
+chat calls: 1
+answer: 'OK<|im_end|>---'
+history valid: True
+messages after: 10
+```
 
-清理：`del "%TEMP%\cc_m3_probe.py"`
+**实测 2（`--inject-400`，注入两次以穿透 `stream_options` 回退，恢复后的重试仍是真实 API）**：
 
-PyCharm：Script path 指向 `%TEMP%\cc_m3_probe.py`，Working directory 为仓库根目录。
+```text
+context rejection: True
+injected 400: True
+collapse calls: 1
+chat calls: 2
+answer: 'OK<|im_end|>black'
+history valid: True
+messages after: 7
+PASS the provider rejection was absorbed by one forced collapse and one retry.
+```
+
+退出码与失败注入：0 恢复成功；1 未恢复或计数不符；2 缺 key、provider 宽容接受（未注入时）或模型未按指令回答。把 `seed_messages()` 的大块历史去掉后重跑，则不应出现 400 或压缩。脚本不写文件，无需清理。
 
 ## 6. M4 工具结果无统一治理
 
@@ -929,12 +908,12 @@ PyCharm：Script path 指向 `%TEMP%\cc_m4_probe.py`，Working directory 为仓�
 | M2 | `llm.py:20-33,209-277`；`agent.py:70-86` | 新增 `finish_reason` 字段与截断分支 | 5 条 truncat 用例 | 附录 A.2 探针 |
 | R1 | `llm.py:270-292`；`agent.py:159-161,180-196,225-234,263-265` | 坏参数三处短路，先于 hooks 与权限 | 组 6（4 条） | 无独立探针，直接跑组 6（见 4.f.1） |
 | R2 | `agent.py:25-29,95-101,126-133`；`cli.py:159-162,334-336` | 终止信号改为抛 `TruncatedOutput`，三个调用方各自接线（含 R4、R5） | 组 3、7、8、9（6 条） | 无独立探针，直接跑组 7（见 4.f.2） |
-| M3 | `llm.py:112-117,180-190`；`context.py:56-76,142-157`；`agent.py:73,76,122` | 超限识别 + 强制压缩 + 固定开销计入估算 | 5 条 context/fixed_overhead 用例 | 附录 A.3 探针 |
+| M3（已实施） | 实施前 `llm.py:112-117,180-190`、`context.py:56-76,142-157`、`agent.py:73,76,122`；现状 `llm.py:108-120`、`context.py:56-86,152`、`agent.py:78-82,84-107,149` | 已实施：超限识别 + 强制压缩重试一次 + 固定开销计入估算 | 组 11（6 条，类定义于 `tests/test_agent_loop_hardening.py:590`） | 附录 A.3 探针；`examples/m3_context_overflow.py`（真实 provider，见 5.e） |
 | M4 | `agent.py:153-168`；`read.py:34-53` | 出口治理 + 文件大小上限 | 6 条 clamp/redact/oversized 用例 | 附录 A.4 探针 |
 
 ## 8. 实施顺序、DoD 与回滚
 
-三步，按“止血 → 防线 → 治理”推进。每步独立提交，失败可单独 revert。**第一步（M1）已完成，后两步（M2 本体与 M3/M4）见下文与第 4–6 节。**
+三步，按“止血 → 防线 → 治理”推进。每步独立提交，失败可单独 revert。**第一步（M1）、第二步（M2）与第三步的 M3 均已完成，仅剩 M4 待实施。**
 
 ### 第一步：M1（P0，止血）——已完成
 
@@ -952,27 +931,34 @@ PyCharm：Script path 指向 `%TEMP%\cc_m4_probe.py`，Working directory 为仓�
   - [x] `ruff check corecoder tests`：`All checks passed!`。
 - 回滚点：`git checkout -- corecoder/agent.py tests/test_agent_loop_hardening.py`。
 
-### 第二步：M2（P0，识别截断）
+### 第二步：M2（P0，识别截断）——已完成（v1.1）
 
 - 改动文件：`corecoder/llm.py`、`corecoder/agent.py`
 - 依赖：M1 的 finally 不变量（截断轮回填后历史必须合法）。
-- 内容：`LLMResponse.finish_reason` + 截断分支 + 连续两次终止。
-- DoD：
-  - 5 条 M2 用例通过；零参数工具回归用例通过。
-  - 全量 `pytest -q` 通过。
-  - 附录 A.2 探针输出 `tool executed: 0`。
-- 回滚点：revert 上述两个文件。
+- 内容：`LLMResponse.finish_reason` + 截断分支 + 连续两次终止；R1/R2 的补充修复见 4.f。
+- DoD（v1.1 实测）：
+  - [x] 5 条 M2 用例通过；零参数工具回归用例通过。
+  - [x] 全量 `pytest -q` 通过（v1.1 为 `242 passed / 1 skipped`；v1.2 加入 M1 后为 245）。
+  - [x] 附录 A.2 探针输出 `tool executed: 0`。
+- 回滚点：revert 上述两个文件（R1/R2 的改动见 4.f）。
 
 ### 第三步：M3，然后 M4（P1，防线与治理）
 
 先 M3 再 M4，理由：M3 只影响失败路径；M4 会改变每一条工具结果的文本，放在最后可以把回归面控制在一处。
 
-**M3**
+**M3——已完成（v1.3）**
 
-- 改动文件：`corecoder/context.py`、`corecoder/llm.py`、`corecoder/agent.py`
+- 改动文件：`corecoder/context.py`、`corecoder/llm.py`、`corecoder/agent.py`、`tests/test_agent_loop_hardening.py`（组 11）、`examples/m3_context_overflow.py`
 - 依赖：M1（重试失败时仍能回填）；与 M2 无直接依赖，但同一函数区域，建议按序。
-- DoD：5 条 M3 用例通过；附录 A.3 探针输出 `chat calls: 2`、`collapse calls: 1`；全量测试通过。
-- 回滚点：revert 三个文件。
+- 内容：`is_context_length_error` + `fixed_tokens` + `force_collapse` + 请求级重试一次；详见 5.c。
+- DoD（v1.3 实测）：
+  - [x] 组 11 的 6 条 M3 用例通过（`6 passed, 20 deselected`，`-k "context or fixed_overhead"`）。
+  - [x] 全量 `pytest -q` 通过：`251 passed, 1 skipped`（既有用例无回归）。
+  - [x] `ruff check corecoder tests`：`All checks passed!`。
+  - [x] 附录 A.3 探针输出 `chat calls: 2`、`collapse calls: 1`。
+  - [x] `examples/m3_context_overflow.py --inject-400`：`collapse calls: 1`、`chat calls: 2`、`answer: 'OK...'`、`history valid: True`（真实 provider 未拒绝 1.45M token 输入，故恢复路径用注入触发，见 5.e）。
+- 提交：`fix(context): recover from context-length rejection`（代码、组 11、脚本与本文件 v1.3 在同一提交）。
+- 回滚点：`git revert <M3 commit>`（不改 `.gitignore`）。
 
 **M4**
 
@@ -986,7 +972,7 @@ PyCharm：Script path 指向 `%TEMP%\cc_m4_probe.py`，Working directory 为仓�
 ```text
 fix(agent): always backfill tool replies on any exception   # M1 已完成 ✔ d05e853
 fix(llm): detect truncated tool calls via finish_reason    # M2（含 R1/R2）
-fix(context): recover from context-length rejection        # M3
+fix(context): recover from context-length rejection        # M3 已完成 ✔
 fix(agent): clamp and redact tool results                  # M4
 ```
 
@@ -1041,18 +1027,20 @@ git grep -n "context_length" corecoder tests
 git grep -n "max_rounds" tests
 ```
 
-**v1.2 实测预期**（`git grep -c` 逐文件）：
+**v1.3 实测预期**（`git grep -c` 逐文件）：
 
 | 关键词 | 预期 | 说明 |
 |---|---|---|
-| `finish_reason` | `corecoder/llm.py` 6 处、`corecoder/agent.py` 1 处 | 已实现（M2）。若你的工作区仍是 0 命中，说明 M2 尚未实施 |
+| `finish_reason` | `corecoder/llm.py` 6 处、`corecoder/agent.py` 1 处、测试 36 处 | 已实现（M2） |
 | `arguments_error` | `corecoder/llm.py` 2 处、`corecoder/agent.py` 1 处 | 已实现（R1） |
-| `TruncatedOutput` | `corecoder/agent.py` 3 处、`corecoder/cli.py` 3 处、`corecoder/__init__.py` 2 处 | 已实现（R2）；三处接线缺一处即静默失败回归 |
-| `context_length` | `corecoder` 下 0 命中 | M3 尚未实施，仍需按 5.c 补 |
-| `max_rounds` | `tests/test_live_smoke.py` 1 处、`tests/test_agent_loop_hardening.py` 3 处（组 3 的 `max_rounds=10`、组 9 的 `max_rounds=1`、一处注释） | **注意：`git grep` 只搜已跟踪文件**。v1.1 时该测试文件尚未提交，只应命中 `test_live_smoke.py` 1 处；v1.2 起它已随 M1 提交入库，两文件共 4 处。若你的工作区仍是 1 处，先确认文件是否被忽略，或改用 `findstr /s /n /c:"max_rounds" tests\*.py` |
-| `except KeyboardInterrupt` | `corecoder/agent.py` 0 处 | **M1 实施的直接标志**：v1.0 这里命中 1 处（仅 Ctrl+C 回填）；v1.2 已改为 `try/finally`，因此 0 命中 |
+| `TruncatedOutput` | `corecoder/agent.py` 3 处、`corecoder/cli.py` 3 处、`corecoder/__init__.py` 2 处、测试 6 处 | 已实现（R2）；三处接线缺一处即静默失败回归 |
+| `context_length` | `corecoder/agent.py` 2 处、`corecoder/llm.py` 2 处 | **已实现（M3，v1.3）**：不再是 0 命中 |
+| `force_collapse` | `corecoder/context.py` 1 处、`corecoder/agent.py` 1 处、测试 1 处 | M3 新增的公共强制压缩入口 |
+| `fixed_tokens` | `corecoder/context.py` 5 处、`corecoder/agent.py` 2 处、测试 2 处 | M3 的固定开销估算；若 agent 侧为 0，说明未计入固定开销 |
+| `max_rounds` | `tests/test_live_smoke.py` 1 处、`tests/test_agent_loop_hardening.py` 3 处（组 3 的 `max_rounds=10`、组 9 的 `max_rounds=1`、一处注释） | **注意：`git grep` 只搜已跟踪文件**。两文件共 4 处；若只命中 1 处，先确认测试文件是否被忽略 |
+| `except KeyboardInterrupt` | `corecoder/agent.py` 0 处 | **M1 实施的直接标志**：v1.0 这里命中 1 处（仅 Ctrl+C 回填）；v1.2 起改为 `try/finally`，因此 0 命中 |
 
-v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder` 下为 0 命中；`max_rounds` 在离线测试中为 0 命中”。M2 与 R1/R2 实施后，`finish_reason` / `arguments_error` / `TruncatedOutput` 都不再是 0，只有 `context_length`（M3 未实施）仍为 0。
+v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder` 下为 0 命中；`max_rounds` 在离线测试中为 0 命中”。M2、R1/R2 与 M3 实施后，`finish_reason` / `arguments_error` / `TruncatedOutput` / `context_length` 都不再是 0。
 
 ### 10.3 provider 的 context-length 文案
 
@@ -1069,6 +1057,8 @@ v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder
 **v1.1**：4.f 节里的行号是 M2 与 R1/R2 实施完成后实测的（`agent.py` 320 行、`llm.py` 378 行、`cli.py` 400 行、`tests/test_agent_loop_hardening.py` 429 行）。
 
 **v1.2**：M1 实施后重新实测为 `agent.py` 322 行、`llm.py` 378 行、`cli.py` 400 行、`tests/test_agent_loop_hardening.py` 550 行。第 3 节的行号已按本次实测更新（3.a 的触发条件表与真实执行路径仍保留 v1.0 值，那是对问题现状的存档）；第 5、6 节以及 4.a–4.e 的行号仍是 v1.0 的写作时值，实施前必须重新定位。
+
+**v1.3**：M3 实施后重新实测为 `agent.py` 345 行、`context.py` 230 行、`llm.py` 392 行、`cli.py` 400 行、`tests/test_agent_loop_hardening.py` 681 行。第 5 节与 4.f.2 的组表已按本次实测更新；第 6 节（M4）与 4.a–4.e 的行号仍是 v1.0 的写作时值，实施 M4 前必须按 10.2 重新定位。
 
 ## 附录 A：人工验证探针
 
