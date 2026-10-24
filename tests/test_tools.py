@@ -8,7 +8,9 @@ from tests.conftest import get_tool
 
 
 def test_tool_count():
-    assert len(ALL_TOOLS) == 8
+    # nine built-ins: bash, read_file, write_file, edit_file, glob, grep,
+    # todo_write, agent and fetch_url
+    assert len(ALL_TOOLS) == 9
 
 
 def test_all_tools_have_valid_schema():
