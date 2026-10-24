@@ -12,7 +12,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 from . import __version__
-from .agent import Agent
+from .agent import Agent, TruncatedOutput
 from .config import Config
 from .hooks import load_hooks
 from .llm import LLM, LiteLLM
@@ -156,6 +156,10 @@ def _run_once(agent: Agent, prompt: str):
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         sys.exit(130)
+    except TruncatedOutput as e:
+        # the answer is unusable: stderr + non-zero so scripts and CI see it
+        err_console.print(f"\n[red]Error: {e}[/red]")
+        sys.exit(1)
     except Exception as e:  # noqa: BLE001
         # one-shot mode: print whatever went wrong and exit non-zero
         console.print(f"\n[red]Error: {e}[/red]")
@@ -327,6 +331,9 @@ def _repl(agent: Agent, config: Config):
                 console.print(Markdown(response))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
+        except TruncatedOutput as e:
+            # the streamed half-answer stays on screen; say why it stopped
+            console.print(f"\n[red]{e}[/red]")
         except Exception as e:  # noqa: BLE001
             # keep the REPL alive no matter what chat() throws
             console.print(f"\n[red]Error: {e}[/red]")

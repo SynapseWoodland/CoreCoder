@@ -22,6 +22,11 @@ class ToolCall:
     id: str
     name: str
     arguments: dict
+    # the JSON exactly as streamed: kept for audit even when it is broken
+    raw_arguments: str = ""
+    # non-empty means the arguments were cut off or were not a JSON object;
+    # the agent must refuse to execute such a call instead of running {}
+    arguments_error: str = ""
 
 
 @dataclass
@@ -262,15 +267,32 @@ class LLM:
                         if tc_delta.function.arguments:
                             tc_map[idx]["args"] += tc_delta.function.arguments
 
-        # parse accumulated tool calls
+        # parse accumulated tool calls. A truncated or malformed argument
+        # string must NOT look like a legitimate zero-argument call: flag it
+        # so the agent refuses to execute it (MCP tools bind {} happily).
         parsed: list[ToolCall] = []
         for idx in sorted(tc_map):
             raw = tc_map[idx]
-            try:
-                args = json.loads(raw["args"])
-            except (json.JSONDecodeError, KeyError):
-                args = {}
-            parsed.append(ToolCall(id=raw["id"], name=raw["name"], arguments=args))
+            raw_args = raw["args"]
+            arg_error = ""
+            if not raw_args.strip():
+                # providers send "" for a tool that genuinely takes no parameters
+                args: dict = {}
+            else:
+                try:
+                    args = json.loads(raw_args)
+                except (json.JSONDecodeError, ValueError):
+                    args, arg_error = {}, raw_args
+                else:
+                    if not isinstance(args, dict):
+                        args, arg_error = {}, raw_args
+            parsed.append(ToolCall(
+                id=raw["id"],
+                name=raw["name"],
+                arguments=args,
+                raw_arguments=raw_args,
+                arguments_error=arg_error,
+            ))
 
         self.total_prompt_tokens += prompt_tok
         self.total_completion_tokens += completion_tok

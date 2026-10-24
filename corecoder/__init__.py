@@ -2,9 +2,9 @@
 
 __version__ = "0.8.0"
 
-from corecoder.agent import Agent
+from corecoder.agent import Agent, TruncatedOutput
 from corecoder.config import Config
 from corecoder.llm import LLM
 from corecoder.tools import ALL_TOOLS
 
-__all__ = ["ALL_TOOLS", "LLM", "Agent", "Config", "__version__"]
+__all__ = ["ALL_TOOLS", "LLM", "Agent", "Config", "TruncatedOutput", "__version__"]

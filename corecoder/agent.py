@@ -22,6 +22,13 @@ from .tools.base import Tool
 from .tools.todo import TodoWriteTool
 
 
+class TruncatedOutput(RuntimeError):
+    """The model hit its output cap twice in a row, so the last tool call was
+    cut off and nothing was executed. Raised instead of returned: a return
+    value is dropped by the streaming REPL, ignored by one-shot mode and read
+    as success by sub-agents, so the failure would be invisible."""
+
+
 class Agent:
     def __init__(
         self,
@@ -86,8 +93,11 @@ class Agent:
                 truncated_rounds += 1
                 self._answer_truncated_tool_calls(resp)
                 if truncated_rounds >= 2:
-                    return ("(model output truncated twice; "
-                            "raise max_tokens or reduce the request)")
+                    # the history is already valid, so a retry or /save still works
+                    raise TruncatedOutput(
+                        "model output truncated twice; raise max_tokens "
+                        "(CORECODER_MAX_TOKENS) or reduce the request"
+                    )
                 continue
 
             # no tool calls -> LLM is done, return text
@@ -113,6 +123,14 @@ class Agent:
             # compress if tool outputs are big
             self.context.maybe_compress(self.messages, self.llm)
 
+        if truncated_rounds:
+            # the cap ran out on a truncated round, so no re-issue ever
+            # happened: still raise, or a small max_rounds would bring back
+            # the silent return this guard exists to remove
+            raise TruncatedOutput(
+                "model output truncated; raise max_tokens "
+                "(CORECODER_MAX_TOKENS) or reduce the request"
+            )
         return "(reached maximum tool-call rounds)"
 
     def _answer_truncated_tool_calls(self, resp) -> None:
@@ -136,7 +154,11 @@ class Agent:
             tc = resp.tool_calls[0]
             if on_tool:
                 on_tool(tc.name, tc.arguments)
-            result = self._pre_hooks(tc) or self._permit(tc)
+            # a call with broken arguments is rejected before hooks and
+            # consent: no side effect, and nobody is asked to approve junk
+            result = (self._bad_arguments(tc)
+                      or self._pre_hooks(tc)
+                      or self._permit(tc))
             if result is None:
                 result = self._exec_tool(tc)
                 self._post_hooks(tc, result)
@@ -154,6 +176,24 @@ class Agent:
                     "tool_call_id": tc.id,
                     "content": result,
                 })
+
+    @staticmethod
+    def _bad_arguments(tc) -> str | None:
+        """Reject a call whose JSON never parsed (truncated or malformed).
+
+        Without this, `json.loads` failure silently becomes `arguments={}`,
+        built-in tools are stopped by `inspect.signature.bind`, but MCP tools
+        (`execute(**kwargs)`) bind {} and run with their defaults.
+        """
+        error = getattr(tc, "arguments_error", "")
+        if not error:
+            return None
+        shown = error if len(error) <= 200 else error[:200] + "..."
+        return (
+            f"Error: bad arguments for {tc.name}: the arguments were cut off or "
+            f"are not a valid JSON object ({shown!r}); the call was NOT executed. "
+            "Re-issue it with one complete, smaller JSON object."
+        )
 
     def _pre_hooks(self, tc) -> str | None:
         """PreToolUse hooks, fired before consent. A string return blocks the
@@ -187,6 +227,11 @@ class Agent:
         tool = self._tool_by_name.get(tc.name)
         if tool is None:
             return f"Error: unknown tool '{tc.name}'"
+        # second line of defence: every execution path lands here, including
+        # parallel workers, so broken arguments can never reach a tool
+        bad = self._bad_arguments(tc)
+        if bad is not None:
+            return bad
         # validate arguments first so a TypeError raised *inside* the tool isn't
         # mislabelled as a bad-arguments error from the caller
         try:
@@ -213,8 +258,11 @@ class Agent:
                 on_tool(tc.name, tc.arguments)
 
         # hooks and consent are settled up front on this thread: prompting
-        # from pool workers would interleave several prompts on one terminal
-        results = [self._pre_hooks(tc) or self._permit(tc) for tc in tool_calls]
+        # from pool workers would interleave several prompts on one terminal.
+        # broken arguments short-circuit both: they are refused, not approved
+        results = [self._bad_arguments(tc)
+                   or self._pre_hooks(tc)
+                   or self._permit(tc) for tc in tool_calls]
         # the tracked cwd is thread-local, so pool workers would otherwise
         # start from the launch directory: hand the session cwd in, and merge
         # any cd back in call order so the batch behaves like a sequence
