@@ -1,9 +1,9 @@
 """TDD tests for M2: truncated tool-call detection & execution guard.
 
-Written BEFORE the fix, per the optimize/agent-loop-must-optimize.md §4.d spec.
-Groups 1-5 pin that spec (finish_reason propagation, the truncation gate,
-backfilling every tool_call id, and stopping after a second truncation).
-Groups 6-7 pin the two P1 follow-ups the review of that fix turned up: an
+Written BEFORE the fix, against the truncation spec that motivated M2.
+Groups 1, 2, 4 and 5 pin that spec (finish_reason propagation, the truncation
+gate, backfilling every tool_call id, and not false-positiving on zero-arg
+tools). Groups 3 and 6-9 pin the P1 follow-ups the review turned up: an
 unparseable argument string must never reach a tool, and the stop must be
 visible to the REPL, to one-shot mode and to a sub-agent.
 """
