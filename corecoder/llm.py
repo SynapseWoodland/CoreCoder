@@ -37,6 +37,9 @@ class LLMResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # False means the provider sent no usage (or null fields). The zeros above
+    # stay for compatibility, but callers must not average them as real data.
+    usage_reported: bool = False
     finish_reason: str = ""  # provider signal: "stop", "length", etc.
 
     @property
@@ -245,6 +248,7 @@ class LLM:
         tc_map: dict[int, dict] = {}  # index -> {id, name, arguments_str}
         prompt_tok = 0
         completion_tok = 0
+        usage_reported = False
         finish_reason = ""
 
         for chunk in stream:
@@ -254,8 +258,12 @@ class LLM:
             if usage:
                 # some providers send usage with null fields; coerce to 0 so the
                 # running totals below don't blow up on int + None
-                prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
-                completion_tok = getattr(usage, "completion_tokens", 0) or 0
+                raw_prompt = getattr(usage, "prompt_tokens", None)
+                raw_completion = getattr(usage, "completion_tokens", None)
+                prompt_tok = raw_prompt or 0
+                completion_tok = raw_completion or 0
+                if raw_prompt is not None and raw_completion is not None:
+                    usage_reported = True
 
             if not getattr(chunk, "choices", None):
                 continue
@@ -329,6 +337,7 @@ class LLM:
             tool_calls=parsed,
             prompt_tokens=prompt_tok,
             completion_tokens=completion_tok,
+            usage_reported=usage_reported,
             finish_reason=finish_reason,
         )
 

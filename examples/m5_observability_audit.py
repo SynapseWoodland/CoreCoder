@@ -20,6 +20,9 @@ Failure injection:
     --inject-bad-args    wrap the real LLM and inject one tool call whose JSON
                          never parsed; assert the tool did NOT run and the audit
                          records decision=bad_arguments / outcome=skipped.
+    --inject-no-pricing  point the pricing table at an empty file, so the real
+                         model has no known price; every cost field must be
+                         None instead of a made-up zero.
 
 Exit codes:
     0  every enabled check passed
@@ -28,6 +31,7 @@ Exit codes:
 """
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -39,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rich.console import Console
 from rich.panel import Panel
 
+from corecoder import llm as llm_module
 from corecoder import observability
 from corecoder.agent import Agent
 from corecoder.config import Config
@@ -137,6 +142,17 @@ def fields(line: str) -> dict:
     return dict(token.split("=", 1) for token in line.split() if "=" in token)
 
 
+def number(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def positive(value) -> bool:
+    return number(value) > 0
+
+
 def reset(path: Path) -> None:
     observability.reset_audit()
     path.write_text("", encoding="utf-8")
@@ -171,10 +187,15 @@ def phase_events(llm, path: Path) -> dict:
     decisions = lines(path, "tool_decision")
     results = lines(path, "tool_result")
     if not decisions or not results:
-        return {"called": False, "tool_calls": len(tool.calls), "valid": history_valid(agent.messages)}
+        return {"called": False, "tool_calls": len(tool.calls),
+                "valid": history_valid(agent.messages)}
 
     decision = fields(decisions[0])
     result = fields(results[0])
+    calls = lines(path, "llm_call")
+    summaries = lines(path, "run_summary")
+    call = fields(calls[0]) if calls else {}
+    summary = fields(summaries[-1]) if summaries else {}
     return {
         "called": bool(tool.calls),
         "tool_calls": len(tool.calls),
@@ -182,8 +203,14 @@ def phase_events(llm, path: Path) -> dict:
         "args_chars": int(decision.get("args_chars", "0")),
         "effective": result.get("effective_decision"),
         "outcome": result.get("outcome"),
-        "duration": float(result.get("duration_ms", "0")),
+        "duration": number(result.get("duration_ms")),
         "valid": history_valid(agent.messages),
+        "usage_reported": call.get("usage_reported"),
+        "prompt_tokens": number(call.get("prompt_tokens")),
+        "call_cost": call.get("cost_usd"),
+        "summary_outcome": summary.get("outcome"),
+        "summary_tokens": number(summary.get("tokens_in")),
+        "summary_cost": summary.get("cost_usd"),
     }
 
 
@@ -233,6 +260,8 @@ def parse_args():
                         help="raise from on_tool and expect a backfill event")
     parser.add_argument("--inject-bad-args", action="store_true",
                         help="inject an unparseable tool call and expect a refusal")
+    parser.add_argument("--inject-no-pricing", action="store_true",
+                        help="empty the pricing table and expect cost_usd=None")
     return parser.parse_args()
 
 
@@ -243,12 +272,18 @@ def main() -> int:
 
     workdir = Path(tempfile.mkdtemp(prefix="corecoder_m5_"))
     audit = workdir / "audit.log"
+    pricing = workdir / "pricing.json"
+    price = {} if args.inject_no_pricing else {cfg.model: [1.0, 2.0]}
+    pricing.write_text(json.dumps(price), encoding="utf-8")
+    llm_module.PRICING_FILE = pricing
+
     # only the audit switch: no CORECODER_LOG_LEVEL, no stream opt-in
     os.environ["CORECODER_AUDIT"] = "1"
     os.environ["CORECODER_AUDIT_FILE"] = str(audit)
 
     console.print(Panel.fit(
         f"model: {cfg.model}\nbase: {cfg.base_url or 'default'}\n"
+        f"pricing: {'none (cost must be None)' if args.inject_no_pricing else 'temp $1/$2 per Mtok'}\n"
         f"audit: {audit}",
         title="M5 - structured audit against a real provider",
     ))
@@ -276,6 +311,26 @@ def main() -> int:
     checks.append(("tool_result duration_ms>0", events.get("duration", 0) > 0,
                    str(events.get("duration"))))
     checks.append(("history valid", events.get("valid") is True, str(events.get("valid"))))
+    checks.append(("llm_call usage_reported=True",
+                   events.get("usage_reported") == "True",
+                   str(events.get("usage_reported"))))
+    checks.append(("llm_call prompt_tokens>0", events.get("prompt_tokens", 0) > 0,
+                   str(events.get("prompt_tokens"))))
+    checks.append(("run_summary outcome=answer",
+                   events.get("summary_outcome") == "answer",
+                   str(events.get("summary_outcome"))))
+    checks.append(("run_summary tokens_in>0", events.get("summary_tokens", 0) > 0,
+                   str(events.get("summary_tokens"))))
+    if args.inject_no_pricing:
+        checks.append(("llm_call cost_usd=None", events.get("call_cost") == "None",
+                       str(events.get("call_cost"))))
+        checks.append(("run_summary cost_usd=None", events.get("summary_cost") == "None",
+                       str(events.get("summary_cost"))))
+    else:
+        checks.append(("llm_call cost_usd>0", positive(events.get("call_cost")),
+                       str(events.get("call_cost"))))
+        checks.append(("run_summary cost_usd>0", positive(events.get("summary_cost")),
+                       str(events.get("summary_cost"))))
 
     if args.inject_backfill:
         section("phase 2 - injected on_tool failure")

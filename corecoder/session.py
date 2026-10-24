@@ -30,6 +30,11 @@ def _new_session_id() -> str:
     return f"session_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
 
+# agent.py carries a session id for its whole lifetime; it should not import
+# the private name
+new_session_id = _new_session_id
+
+
 def _session_path(session_id: str) -> Path:
     path = (SESSIONS_DIR / f"{_normalize_session_id(session_id)}.json").resolve()
     root = SESSIONS_DIR.resolve()
@@ -56,18 +61,28 @@ def save_session(messages: list[dict], model: str, session_id: str | None = None
     return session_id
 
 
-def load_session(session_id: str) -> tuple[list[dict], str] | None:
-    """Load a saved session. Returns (messages, model) or None."""
+def load_session_record(session_id: str) -> dict | None:
+    """Load the whole saved record (id, messages, model, ...) or None."""
     path = _session_path(session_id)
     if not path.exists():
         return None
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data["messages"], data["model"]
+        if not isinstance(data, dict) or "messages" not in data or "model" not in data:
+            return None
+        return data
     except (json.JSONDecodeError, UnicodeDecodeError, KeyError, OSError):
         # a corrupt or truncated session file shouldn't crash resume
         return None
+
+
+def load_session(session_id: str) -> tuple[list[dict], str] | None:
+    """Load a saved session. Returns (messages, model) or None."""
+    record = load_session_record(session_id)
+    if record is None:
+        return None
+    return record["messages"], record["model"]
 
 
 def list_sessions() -> list[dict]:

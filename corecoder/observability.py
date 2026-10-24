@@ -110,9 +110,9 @@ def prune_old_logs(pattern, keep: int = 10, skip: Path | None = None) -> None:
                 continue
             try:
                 old.unlink()
-            except OSError:
+            except OSError:  # a locked old log is not worth failing on
                 pass
-    except Exception:  # noqa: BLE001 - retention must never break startup
+    except Exception:  # noqa: BLE001, S110 - retention must never break startup
         pass
 
 
@@ -165,13 +165,13 @@ def configure_audit(stream=None, file=None, level=None) -> None:
             _state.disabled = True
             try:
                 _general.warning("event=audit_disabled error_type=%s", type(e).__name__)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 - the warning is best-effort
                 pass
             return
         configured = level if level is not None else os.getenv("CORECODER_AUDIT_LEVEL", "INFO")
         handler.setLevel(_parse_level(configured))
         handler.setFormatter(logging.Formatter("%(message)s"))
-        setattr(handler, "_cc_audit", True)
+        handler._cc_audit = True
         audit_logger.addHandler(handler)
         _state.handler = handler
 
@@ -198,7 +198,7 @@ def _write_failed(exc: BaseException) -> None:
         _state.warned = True
         try:
             _general.warning("event=audit_write_failed error_type=%s", type(exc).__name__)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110 - the warning is best-effort
             pass
     if _state.failures >= 3:
         _state.disabled = True
@@ -226,7 +226,7 @@ def log_event(event: str, level: int = logging.INFO, **fields) -> None:
             _write_failed(e)
         else:
             _state.failures = 0
-    except Exception:  # noqa: BLE001 - log_event is called from finally blocks
+    except Exception:  # noqa: BLE001, S110 - log_event runs in finally blocks
         pass
 
 
@@ -253,6 +253,6 @@ def configure_logging() -> None:
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     handler.setLevel(level)
-    setattr(handler, "_cc_general", True)
+    handler._cc_general = True
     logger.addHandler(handler)
     logger.setLevel(level)

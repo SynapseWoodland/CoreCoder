@@ -13,6 +13,7 @@ import concurrent.futures
 import inspect
 import json
 import logging
+import os
 import re
 import time
 
@@ -21,6 +22,7 @@ from .llm import LLM, is_context_length_error
 from .observability import log_event
 from .permissions import Permission
 from .prompt import PLAN_MODE_PROMPT, system_prompt
+from .session import new_session_id
 from .tools import ALL_TOOLS
 from .tools.agent import AgentTool
 from .tools.base import Tool, ToolRefused
@@ -44,8 +46,10 @@ class Agent:
         permission=None,
         hooks=None,
         max_tool_result_chars: int = 15_000,
+        session_id: str | None = None,
     ):
         self.llm = llm
+        self.session_id = session_id or new_session_id()
         self.tools = tools if tools is not None else ALL_TOOLS
         self.permission = permission
         self.hooks = hooks
@@ -90,98 +94,179 @@ class Agent:
     def chat(self, user_input: str, on_token=None, on_tool=None, on_reasoning=None) -> str:
         """Process one user message. May involve multiple LLM/tool rounds."""
         self.messages.append({"role": "user", "content": user_input})
-        self.context.maybe_compress(
-            self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
+        started = time.perf_counter()
+        cost_before = self._estimated_cost()
+        outcome = "max_rounds"
+        rounds = 0
+        tool_calls = 0
+        tokens_in = 0
+        tokens_out = 0
+        usage_reported = True
+        stats = {"executed": 0}
 
-        truncated_rounds = 0  # M2 guard: consecutive truncation counter
-        for round_idx in range(self.max_rounds):
-            current_round = round_idx + 1
-            try:
-                resp = self.llm.chat(
-                    messages=self._full_messages(),
-                    tools=self._tool_schemas(),
-                    on_token=on_token,
-                    on_reasoning=on_reasoning,
-                )
-            except Exception as e:
-                # provider tokenizers and our estimate never agree exactly, so a
-                # rejection is the last line of defence: collapse once and
-                # re-issue. A too-short history cannot free enough to help.
-                if not is_context_length_error(e) or len(self.messages) <= 4:
-                    raise
-                before_messages = len(self.messages)
-                before_tokens = estimate_tokens(self.messages) + self._fixed_prompt_tokens()
-                self.context.force_collapse(self.messages, self.llm)
-                log_event(
-                    "context_overflow",
-                    messages_before=before_messages,
-                    messages_after=len(self.messages),
-                    estimated_before=before_tokens,
-                    estimated_after=(
-                        estimate_tokens(self.messages) + self._fixed_prompt_tokens()),
-                    error_type=type(e).__name__,
-                )
-                resp = self.llm.chat(
-                    messages=self._full_messages(),
-                    tools=self._tool_schemas(),
-                    on_token=on_token,
-                    on_reasoning=on_reasoning,
-                )
-
-            # M2: truncated response with tool_calls -> do NOT execute anything
-            if resp.finish_reason == "length" and resp.tool_calls:
-                truncated_rounds += 1
-                log_event(
-                    "output_truncated",
-                    consecutive=truncated_rounds,
-                    tool_calls=len(resp.tool_calls),
-                    round=current_round,
-                )
-                self._answer_truncated_tool_calls(resp)
-                if truncated_rounds >= 2:
-                    # the history is already valid, so a retry or /save still works
-                    raise TruncatedOutput(
-                        "model output truncated twice; raise max_tokens "
-                        "(CORECODER_MAX_TOKENS) or reduce the request"
-                    )
-                continue
-
-            # no tool calls -> LLM is done, return text
-            if not resp.tool_calls:
-                self.messages.append(resp.message)
-                return resp.content
-
-            # reset consecutive counter on a successful non-truncated round
-            truncated_rounds = 0
-
-            # tool calls -> execute (parallel when multiple, like Claude Code's
-            # StreamingToolExecutor which runs independent tools concurrently)
-            self.messages.append(resp.message)
-
-            try:
-                self._execute_round(resp, on_tool, round_idx=current_round)
-            finally:
-                # any escape from the round (Ctrl+C, a crashing on_tool or ask
-                # callback, a BaseException from a tool) would leave the
-                # assistant tool_calls message without replies and poison
-                # every later request, so the backfill is unconditional and
-                # idempotent: on a clean round it is a no-op
-                self._answer_pending_tool_calls(resp.tool_calls)
-
-            # compress if tool outputs are big
+        try:
             self.context.maybe_compress(
                 self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
 
-        if truncated_rounds:
-            # the cap ran out on a truncated round, so no re-issue ever
-            # happened: still raise, or a small max_rounds would bring back
-            # the silent return this guard exists to remove
-            raise TruncatedOutput(
-                "model output truncated; raise max_tokens "
-                "(CORECODER_MAX_TOKENS) or reduce the request"
+            truncated_rounds = 0  # M2 guard: consecutive truncation counter
+            for round_idx in range(self.max_rounds):
+                current_round = round_idx + 1
+                rounds = current_round
+                estimated_prompt = (
+                    estimate_tokens(self._full_messages()) + self._fixed_prompt_tokens())
+                call_started = time.perf_counter()
+                call_cost_before = self._estimated_cost()
+                retried = False
+                try:
+                    resp = self.llm.chat(
+                        messages=self._full_messages(),
+                        tools=self._tool_schemas(),
+                        on_token=on_token,
+                        on_reasoning=on_reasoning,
+                    )
+                except Exception as e:
+                    # provider tokenizers and our estimate never agree exactly, so a
+                    # rejection is the last line of defence: collapse once and
+                    # re-issue. A too-short history cannot free enough to help.
+                    if not is_context_length_error(e) or len(self.messages) <= 4:
+                        raise
+                    before_messages = len(self.messages)
+                    before_tokens = estimate_tokens(self.messages) + self._fixed_prompt_tokens()
+                    self.context.force_collapse(self.messages, self.llm)
+                    log_event(
+                        "context_overflow",
+                        messages_before=before_messages,
+                        messages_after=len(self.messages),
+                        estimated_before=before_tokens,
+                        estimated_after=(
+                            estimate_tokens(self.messages) + self._fixed_prompt_tokens()),
+                        error_type=type(e).__name__,
+                    )
+                    retried = True
+                    resp = self.llm.chat(
+                        messages=self._full_messages(),
+                        tools=self._tool_schemas(),
+                        on_token=on_token,
+                        on_reasoning=on_reasoning,
+                    )
+
+                log_event(
+                    "llm_call", round=current_round,
+                    model=getattr(self.llm, "model", ""),
+                    estimated_prompt=estimated_prompt,
+                    prompt_tokens=resp.prompt_tokens if resp.usage_reported else None,
+                    completion_tokens=(
+                        resp.completion_tokens if resp.usage_reported else None),
+                    usage_reported=resp.usage_reported,
+                    finish_reason=resp.finish_reason,
+                    tool_calls=len(resp.tool_calls),
+                    duration_ms=round((time.perf_counter() - call_started) * 1000, 3),
+                    retried=retried,
+                    cost_usd=_cost_delta(call_cost_before, self._estimated_cost()),
+                )
+                if resp.usage_reported:
+                    tokens_in += resp.prompt_tokens
+                    tokens_out += resp.completion_tokens
+                else:
+                    usage_reported = False
+
+                # M2: truncated response with tool_calls -> do NOT execute anything
+                if resp.finish_reason == "length" and resp.tool_calls:
+                    truncated_rounds += 1
+                    log_event(
+                        "output_truncated",
+                        consecutive=truncated_rounds,
+                        tool_calls=len(resp.tool_calls),
+                        round=current_round,
+                    )
+                    self._answer_truncated_tool_calls(resp)
+                    if truncated_rounds >= 2:
+                        # the history is already valid, so a retry or /save still works
+                        raise TruncatedOutput(
+                            "model output truncated twice; raise max_tokens "
+                            "(CORECODER_MAX_TOKENS) or reduce the request"
+                        )
+                    continue
+
+                # no tool calls -> LLM is done, return text
+                if not resp.tool_calls:
+                    self.messages.append(resp.message)
+                    outcome = "answer"
+                    return resp.content
+
+                # reset consecutive counter on a successful non-truncated round
+                truncated_rounds = 0
+
+                # tool calls -> execute (parallel when multiple, like Claude Code's
+                # StreamingToolExecutor which runs independent tools concurrently)
+                self.messages.append(resp.message)
+                tool_calls += len(resp.tool_calls)
+
+                try:
+                    self._execute_round(
+                        resp, on_tool, round_idx=current_round, stats=stats)
+                finally:
+                    # any escape from the round (Ctrl+C, a crashing on_tool or ask
+                    # callback, a BaseException from a tool) would leave the
+                    # assistant tool_calls message without replies and poison
+                    # every later request, so the backfill is unconditional and
+                    # idempotent: on a clean round it is a no-op
+                    self._answer_pending_tool_calls(resp.tool_calls)
+
+                # compress if tool outputs are big
+                self.context.maybe_compress(
+                    self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
+
+            if truncated_rounds:
+                # the cap ran out on a truncated round, so no re-issue ever
+                # happened: still raise, or a small max_rounds would bring back
+                # the silent return this guard exists to remove
+                raise TruncatedOutput(
+                    "model output truncated; raise max_tokens "
+                    "(CORECODER_MAX_TOKENS) or reduce the request"
+                )
+            log_event("max_rounds", level=logging.WARNING, rounds=self.max_rounds)
+            return "(reached maximum tool-call rounds)"
+        except TruncatedOutput:
+            outcome = "truncated"
+            raise
+        except KeyboardInterrupt:
+            outcome = "interrupted"
+            raise
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            self._log_run_summary(
+                outcome=outcome, rounds=rounds, tool_calls=tool_calls,
+                tools_executed=stats["executed"], tokens_in=tokens_in,
+                tokens_out=tokens_out, usage_reported=usage_reported,
+                cost_before=cost_before, started=started,
             )
-        log_event("max_rounds", level=logging.WARNING, rounds=self.max_rounds)
-        return "(reached maximum tool-call rounds)"
+
+    def _estimated_cost(self) -> float | None:
+        return getattr(self.llm, "estimated_cost", None)
+
+    def _log_run_summary(self, *, outcome, rounds, tool_calls, tools_executed,
+                         tokens_in, tokens_out, usage_reported, cost_before,
+                         started) -> None:
+        from . import __version__
+        log_event(
+            "run_summary",
+            session=self.session_id,
+            version=__version__,
+            build=os.getenv("CORECODER_BUILD", ""),
+            model=getattr(self.llm, "model", ""),
+            outcome=outcome,
+            rounds=rounds,
+            tool_calls=tool_calls,
+            tools_executed=tools_executed,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            usage_reported=usage_reported,
+            cost_usd=_cost_delta(cost_before, self._estimated_cost()),
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
 
     def _answer_truncated_tool_calls(self, resp) -> None:
         """M2: record a truncated response and reply to every tool call with a
@@ -197,7 +282,7 @@ class Agent:
                 ),
             })
 
-    def _execute_round(self, resp, on_tool=None, round_idx=None) -> None:
+    def _execute_round(self, resp, on_tool=None, round_idx=None, stats=None) -> None:
         """Execute one tool-call round: single calls inline, multiple calls in
         parallel, appending one tool reply per call to the history."""
         if len(resp.tool_calls) == 1:
@@ -214,6 +299,8 @@ class Agent:
             if result is None:
                 result = self._exec_tool(tc, meta)
                 self._post_hooks(tc, result)
+                if stats is not None and not meta.get("refused"):
+                    stats["executed"] += 1
             else:
                 meta.update(chars_in=len(result), chars_out=len(result),
                             error_text=result.startswith("Error:"))
@@ -225,7 +312,8 @@ class Agent:
             })
         else:
             # parallel execution for multiple tool calls
-            results = self._exec_tools_parallel(resp.tool_calls, on_tool, round_idx)
+            results = self._exec_tools_parallel(
+                resp.tool_calls, on_tool, round_idx, stats=stats)
             for tc, result in zip(resp.tool_calls, results):
                 self.messages.append({
                     "role": "tool",
@@ -410,7 +498,8 @@ class Agent:
             meta["refused"] = True
         return out
 
-    def _exec_tools_parallel(self, tool_calls, on_tool=None, round_idx=None) -> list[str]:
+    def _exec_tools_parallel(self, tool_calls, on_tool=None, round_idx=None,
+                             stats=None) -> list[str]:
         """Run multiple tool calls concurrently using threads.
 
         This is inspired by Claude Code's StreamingToolExecutor which starts
@@ -479,6 +568,9 @@ class Agent:
                     set_tracked_cwd(worker_cwd)
         for i in futures:
             self._post_hooks(tool_calls[i], results[i])
+        if stats is not None:
+            stats["executed"] += sum(
+                1 for meta in metas.values() if not meta.get("refused"))
         return results
 
     def _answer_pending_tool_calls(self, tool_calls):
@@ -524,3 +616,10 @@ def _redact(text: str) -> str:
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def _cost_delta(before: float | None, after: float | None) -> float | None:
+    """Per-call cost: a delta of the running estimate, never an absolute total."""
+    if before is None or after is None:
+        return None
+    return round(after - before, 6)

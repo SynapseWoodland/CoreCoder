@@ -19,7 +19,7 @@ from .llm import LLM, LiteLLM
 from .mcp import load_mcp_tools
 from .observability import configure_logging
 from .permissions import DEFAULT_STORE, Permission
-from .session import list_sessions, load_session, save_session
+from .session import list_sessions, load_session_record, save_session
 from .tools import ALL_TOOLS
 
 console = Console()
@@ -103,9 +103,11 @@ def main():
 
     # resume saved session
     if args.resume:
-        loaded = load_session(args.resume)
-        if loaded:
-            agent.messages, loaded_model = loaded
+        record = load_session_record(args.resume)
+        if record:
+            agent.messages = record["messages"]
+            agent.session_id = record.get("id", agent.session_id)
+            loaded_model = record["model"]
             # restore the model from the saved session unless overridden by CLI
             if not args.model:
                 agent.llm.model = loaded_model
@@ -272,7 +274,7 @@ def _repl(agent: Agent, config: Config):
                 console.print(f"[dim]Nothing to compress ({before} tokens, {len(agent.messages)} messages)[/dim]")
             continue
         if user_input == "/save":
-            sid = save_session(agent.messages, config.model)
+            sid = save_session(agent.messages, config.model, session_id=agent.session_id)
             console.print(f"[green]Session saved: {sid}[/green]")
             console.print(f"Resume with: corecoder -r {sid}")
             continue

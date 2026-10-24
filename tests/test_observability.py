@@ -19,13 +19,15 @@ import pytest
 from openai import APIConnectionError, BadRequestError
 
 from corecoder import observability
-from corecoder.agent import Agent
+from corecoder import session as session_module
+from corecoder.agent import Agent, TruncatedOutput
 from corecoder.context import ContextManager
 from corecoder.demo import ScriptedLLM
 from corecoder.llm import LLM, LiteLLM, LLMResponse, ToolCall
 from corecoder.permissions import Permission
-from corecoder.tools.bash import BashTool
+from corecoder.session import load_session, load_session_record, save_session
 from corecoder.tools.base import Tool, ToolRefused
+from corecoder.tools.bash import BashTool
 
 
 @pytest.fixture(autouse=True)
@@ -677,11 +679,165 @@ def test_audit_never_records_prompts_arguments_or_results():
     assert "please use" not in out.getvalue()
 
 
-# ─── 8. CLI wiring ─────────────────────────────────────────────────────────
+# ─── 8. cost and run summary ───────────────────────────────────────────────
+
+def _stream(prompt=10, completion=5, content="done", with_usage=True):
+    chunks = [SimpleNamespace(
+        usage=None,
+        choices=[SimpleNamespace(
+            delta=SimpleNamespace(content=content, tool_calls=None, reasoning_content=None),
+            finish_reason="stop",
+        )],
+    )]
+    usage = (SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion)
+             if with_usage else None)
+    chunks.append(SimpleNamespace(usage=usage, choices=[]))
+    return chunks
+
+
+def _real_llm(model="gpt-4o", **stream_kwargs):
+    llm = LLM(model=model, api_key="sk-test")
+    llm.client = mock.Mock()
+    llm.client.chat.completions.create.return_value = _stream(**stream_kwargs)
+    return llm
+
+
+def test_unreported_usage_is_logged_as_unknown_not_zero():
+    llm = _real_llm(with_usage=False)
+    resp = llm.chat(messages=[{"role": "user", "content": "hi"}])
+    assert resp.prompt_tokens == 0 and resp.completion_tokens == 0
+    assert resp.usage_reported is False
+
+    out = _capture()
+    agent = Agent(llm=llm, tools=[])
+    agent.chat("hi")
+
+    call = _fields(_lines(out, "llm_call")[0])
+    assert call["prompt_tokens"] == "None"
+    assert call["completion_tokens"] == "None"
+    assert call["usage_reported"] == "False"
+    summary = _fields(_lines(out, "run_summary")[0])
+    assert summary["usage_reported"] == "False"
+    assert summary["tokens_in"] == "0"
+
+
+def test_cost_is_reported_for_priced_models_and_none_for_unknown_ones():
+    out = _capture()
+    Agent(llm=_real_llm(prompt=1000, completion=500), tools=[]).chat("hi")
+
+    call = _fields(_lines(out, "llm_call")[0])
+    summary = _fields(_lines(out, "run_summary")[0])
+    assert float(call["cost_usd"]) > 0
+    assert float(summary["cost_usd"]) > 0
+    assert float(summary["cost_usd"]) == pytest.approx(0.0075, abs=1e-6)
+
+    out2 = _capture()
+    Agent(llm=_real_llm(model="unknown-model"), tools=[]).chat("hi")
+    assert _fields(_lines(out2, "llm_call")[0])["cost_usd"] == "None"
+    assert _fields(_lines(out2, "run_summary")[0])["cost_usd"] == "None"
+
+
+def test_run_summary_covers_answer_truncated_and_interrupted():
+    out = _capture()
+    Agent(llm=ScriptedLLM([LLMResponse(content="done")]), tools=[]).chat("hi")
+    assert _fields(_lines(out, "run_summary")[0])["outcome"] == "answer"
+
+    out2 = _capture()
+    truncated = ScriptedLLM([
+        LLMResponse(content="", tool_calls=[_tc()], finish_reason="length"),
+        LLMResponse(content="", tool_calls=[_tc(call_id="c2")], finish_reason="length"),
+    ])
+    with pytest.raises(TruncatedOutput):
+        Agent(llm=truncated, tools=[SpyTool()]).chat("hi")
+    assert _fields(_lines(out2, "run_summary")[0])["outcome"] == "truncated"
+
+    out3 = _capture()
+
+    class Killer(SpyTool):
+        def execute(self):
+            raise KeyboardInterrupt
+
+    killer = Killer()
+    killer.name = "killer"
+    with pytest.raises(KeyboardInterrupt):
+        Agent(llm=ScriptedLLM([_turn(_tc("killer", "c1"))]), tools=[killer]).chat("go")
+    assert _fields(_lines(out3, "run_summary")[0])["outcome"] == "interrupted"
+
+
+def test_run_summary_carries_version_and_build(monkeypatch):
+    from corecoder import __version__
+
+    monkeypatch.setenv("CORECODER_BUILD", "abc123")
+    out = _capture()
+    Agent(llm=ScriptedLLM([LLMResponse(content="done")]), tools=[]).chat("hi")
+
+    summary = _fields(_lines(out, "run_summary")[0])
+    assert summary["version"] == __version__
+    assert summary["build"] == "abc123"
+
+
+def test_token_totals_come_only_from_reported_rounds():
+    tool = SpyTool()
+    llm = ScriptedLLM([
+        LLMResponse(content="", tool_calls=[_tc()], prompt_tokens=10,
+                    completion_tokens=2, usage_reported=True),
+        LLMResponse(content="done", prompt_tokens=999, completion_tokens=999,
+                    usage_reported=False),
+    ])
+    out = _capture()
+    Agent(llm=llm, tools=[tool]).chat("hi")
+
+    summary = _fields(_lines(out, "run_summary")[0])
+    assert summary["tokens_in"] == "10"
+    assert summary["tokens_out"] == "2"
+    assert summary["usage_reported"] == "False"
+    assert summary["rounds"] == "2"
+    assert summary["tool_calls"] == "1"
+    assert summary["tools_executed"] == "1"
+
+
+def test_tools_executed_excludes_refusals():
+    agent = Agent(llm=ScriptedLLM([
+        _turn(_tc("bash", "c1", {"command": "rm -rf /"})),
+        LLMResponse(content="done"),
+    ]), tools=[BashTool()])
+    out = _capture()
+
+    agent.chat("hi")
+
+    summary = _fields(_lines(out, "run_summary")[0])
+    assert summary["tool_calls"] == "1"
+    assert summary["tools_executed"] == "0"
+
+
+def test_session_id_is_stable_across_save_and_resume(monkeypatch, tmp_path):
+    monkeypatch.setattr(session_module, "SESSIONS_DIR", tmp_path)
+    from corecoder.session import new_session_id
+
+    assert new_session_id().startswith("session_")
+
+    out = _capture()
+    agent = Agent(llm=ScriptedLLM([LLMResponse(content="done")]), tools=[],
+                  session_id="s1")
+    agent.chat("hi")
+    assert _fields(_lines(out, "run_summary")[0])["session"] == "s1"
+
+    assert save_session(agent.messages, "gpt-4o", session_id=agent.session_id) == "s1"
+    record = load_session_record("s1")
+    assert record["id"] == "s1"
+    assert load_session("s1") == (record["messages"], "gpt-4o")
+
+    out2 = _capture()
+    resumed = Agent(llm=ScriptedLLM([LLMResponse(content="again")]), tools=[],
+                    session_id=record["id"])
+    resumed.chat("again")
+    assert _fields(_lines(out2, "run_summary")[0])["session"] == "s1"
+
+
+# ─── 9. CLI wiring ─────────────────────────────────────────────────────────
 
 def test_main_configures_logging(monkeypatch):
-    import corecoder.cli as cli
-    from corecoder import demo
+    from corecoder import cli, demo
 
     calls = []
     monkeypatch.setattr(cli, "configure_logging", lambda: calls.append(1))
