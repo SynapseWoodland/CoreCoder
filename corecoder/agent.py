@@ -596,6 +596,24 @@ class Agent:
             meta["refused"] = True
         return out
 
+    @staticmethod
+    def _await_future(future, poll: float = 0.1):
+        """Wait for one worker while staying responsive to Ctrl+C.
+
+        A bare `future.result()` blocks in a lock wait, where a pending
+        interrupt is only delivered once that wait returns (a 2s tool would
+        swallow Ctrl+C for 2s). Polling lets the interpreter check the pending
+        signal between waits.
+        """
+        while True:
+            try:
+                return future.result(timeout=poll)
+            except concurrent.futures.TimeoutError:
+                if future.done():
+                    # re-raise whatever the worker stored (a TimeoutError from
+                    # the tool must not be mistaken for our poll timing out)
+                    return future.result()
+
     def _exec_tools_parallel(self, tool_calls, on_tool=None, round_idx=None,
                              stats=None) -> list[str]:
         """Run multiple tool calls concurrently using threads.
@@ -603,6 +621,11 @@ class Agent:
         This is inspired by Claude Code's StreamingToolExecutor which starts
         executing tools while the model is still generating.  We simplify to:
         when the model returns N tool calls at once, run them in parallel.
+
+        Interrupting (Ctrl+C) stops waiting immediately and cancels queued
+        calls. A call already running keeps going: Python threads cannot be
+        killed, so it may still write to the workspace after chat() returns;
+        its result is discarded and the history gets `[interrupted]`.
         """
         from .tools.bash import get_tracked_cwd, set_tracked_cwd
 
@@ -640,31 +663,49 @@ class Agent:
             for i, tc in enumerate(tool_calls)
             if settled[i][0] is None
         }
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            def run(i, tc, base_cwd):
-                is_bash = tc.name == "bash"
-                if is_bash and base_cwd is not None:
-                    set_tracked_cwd(base_cwd)
-                out = self._exec_tool(tc, metas[i])
-                if not is_bash:
-                    return i, out, None
-                cwd_after = get_tracked_cwd()
-                # only a worker that actually moved the dir reports back; a
-                # sibling that merely inherited the base must not revert a cd
-                return i, out, cwd_after if cwd_after != base_cwd else None
+        def run(i, tc, base_cwd):
+            is_bash = tc.name == "bash"
+            if is_bash and base_cwd is not None:
+                set_tracked_cwd(base_cwd)
+            out = self._exec_tool(tc, metas[i])
+            if not is_bash:
+                return i, out, None
+            cwd_after = get_tracked_cwd()
+            # only a worker that actually moved the dir reports back; a
+            # sibling that merely inherited the base must not revert a cd
+            return i, out, cwd_after if cwd_after != base_cwd else None
 
+        # not a `with` block: its __exit__ calls shutdown(wait=True), so Ctrl+C
+        # would block until every running tool returned. Queued calls are
+        # cancelled instead; a call already running cannot be killed (threads
+        # cannot be interrupted in Python), so it finishes in the background
+        # and its result is dropped. Pre-bound so an interrupt during submit
+        # still reports submitted=0 instead of raising NameError.
+        futures: dict = {}
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="cc-tool")
+        try:
             futures = {
                 i: pool.submit(run, i, tc, session_cwd)
                 for i, tc in enumerate(tool_calls)
                 if i in metas
             }
             for i, future in futures.items():
-                i, results[i], worker_cwd = future.result()
+                i, results[i], worker_cwd = self._await_future(future)
                 self._log_result(tool_calls[i], "execute", metas[i], round_idx,
                                  result=results[i])
                 if worker_cwd is not None:
                     session_cwd = worker_cwd
                     set_tracked_cwd(worker_cwd)
+        except BaseException:
+            inflight = sum(not f.done() for f in futures.values())
+            log_event("batch_interrupted", level=logging.WARNING,
+                      submitted=len(futures), inflight=inflight)
+            self._trace_event("batch_interrupted",
+                              submitted=len(futures), inflight=inflight)
+            raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         for i in futures:
             self._post_hooks(tool_calls[i], results[i])
         if stats is not None:

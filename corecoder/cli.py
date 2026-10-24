@@ -161,6 +161,8 @@ def _run_once(agent: Agent, prompt: str):
         agent.chat(prompt, on_token=on_token, on_tool=on_tool, on_reasoning=on_reasoning)
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
+        console.print("[dim]A parallel tool call already running may still finish; "
+                      "re-check the workspace shortly.[/dim]")
         sys.exit(130)
     except TruncatedOutput as e:
         # the answer is unusable: stderr + non-zero so scripts and CI see it
@@ -337,6 +339,8 @@ def _repl(agent: Agent, config: Config):
                 console.print(Markdown(response))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
+            console.print("[dim]A parallel tool call already running may still finish; "
+                          "re-check the workspace shortly.[/dim]")
         except TruncatedOutput as e:
             # the streamed half-answer stays on screen; say why it stopped
             console.print(f"\n[red]{e}[/red]")
