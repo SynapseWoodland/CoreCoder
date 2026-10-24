@@ -2,7 +2,7 @@
 
 - 审查对象：`corecoder/agent.py` 中 `Agent.chat()` 主循环（v1.0 写作时为第 70–124 行，v1.2 实测为第 77–138 行）及其直接依赖
 - 审查基线：当前工作区 `main` 分支；文中行号均为写作时实测值
-- 文档版本：v1.3（2026-10-24）。v1.0 为审查定稿；v1.1 为 M2 实施后的复核回写，新增 0.5 节与 4.f 节，并同步第 7、9、10 节；v1.2 为 M1 实施后的回写，把第 3、7、8 节的状态改为已实施，并同步实测测试数；v1.3 为 M3 实施后的回写，更新第 2、5、7、8 节与 4.f.2 的组表，并同步 10.2、10.5 的实测值
+- 文档版本：v1.4（2026-10-24）。v1.0 为审查定稿；v1.1 为 M2 实施后的复核回写，新增 0.5 节与 4.f 节，并同步第 7、9、10 节；v1.2 为 M1 实施后的回写，把第 3、7、8 节的状态改为已实施，并同步实测测试数；v1.3 为 M3 实施后的回写，更新第 2、5、7、8 节与 4.f.2 的组表，并同步 10.2、10.5 的实测值；v1.4 为 M4 实施后的回写，更新第 2、6、7、8 节与 4.f.2 的组表，并同步 10.2、10.5 的实测值
 - 读者：未参与前序讨论、需要直接实施改造的工程师
 - 路径约定：除特别说明外，所有路径相对仓库根目录 `D:\github\CoreCoder`
 
@@ -12,7 +12,9 @@
 >
 > v1.2 增补：M1 已按第 3 节实施，采用 `try/finally` 无条件回填（幂等）。实施记录、组 10 的 5 条用例与实测结果回写在 3.c–3.e；第 7、8 节标为已实施，4.f.2 的测试数与组数同步为实测值。
 >
-> v1.3 增补：M3 已按第 5 节实施（请求级兜底 + 固定开销计入估算）。实施记录、组 11 的 6 条用例与实测结果回写在 5.c–5.e；第 2、7、8 节标为已实施，4.f.2 的组表、10.2 的 grep 预期与 10.5 的行数同步为实测值。M4 仍未实施。
+> v1.3 增补：M3 已按第 5 节实施（请求级兜底 + 固定开销计入估算）。实施记录、组 11 的 6 条用例与实测结果回写在 5.c–5.e；第 2、7、8 节标为已实施，4.f.2 的组表、10.2 的 grep 预期与 10.5 的行数同步为实测值。
+>
+> v1.4 增补：M4 已按第 6 节实施（工具结果出口统一封顶与脱敏 + `read_file` 文件大小上限）。实施记录、组 12 的 6 条用例与实测结果回写在 6.c–6.e；第 2、7、8 节标为已实施，4.f.2 的组表、10.2 的 grep 预期与 10.5 的行数同步为实测值。至此 4 项必须优化全部实施完成；第 9 节的残留项保持原样。
 
 ## 0. 与上一轮审查的对应关系
 
@@ -52,6 +54,7 @@
 - v1.1 例外：4.f 节描述的是已实施并已跑过全量测试的行为，其中的行号与测试数为 v1.1 当时实测值。
 - v1.2 例外：第 3 节（M1）同样已实施并跑过全量测试，3.c–3.e 中的代码、行号与命令结果为 v1.2 实测值，不再用“应”表述；第 5、6 节（M3、M4）仍是 v1.0 的“应”表述，实施时请按 10.5 重新定位行号。
 - v1.3 例外：第 5 节（M3）已实施并跑过全量测试与真实 provider 脚本，5.c–5.e 为 v1.3 实测值；5.a 保留 v1.0 的问题存档，其中行号是修复前位置。第 6 节（M4）仍是 v1.0 的“应”表述，实施时请按 10.5 重新定位行号。
+- v1.4 例外：第 6 节（M4）已实施并跑过全量测试与真实 provider 脚本，6.c–6.e 为 v1.4 实测值；6.a 保留 v1.0 的问题存档，其中行号是修复前位置。第 5 节与第 6 节之外的实施前存档（3.a、4.a–4.e）仍保留原值。
 
 ### 0.5 v1.1 复核严重度分级与本文编号的关系
 
@@ -111,7 +114,7 @@ M2 实施完成后追加两轮生产级复核。复核按严重度分级给出�
 | M1（v1.2 已实施） | 异常回填覆盖面不足 | 一次非 Ctrl+C 失败后，后续每轮请求都可能被 API 拒绝，只能 `/reset` | 高 | P0 | 实施前：`agent.py:90-119,217-231`；现状：`agent.py:113-124,299-313`；`hooks.py:70-88`；`permissions.py:53`；`cli.py:320-332` |
 | M2（v1.1 已实施） | 截断响应未识别 | 截断时工具被空参数调用（MCP 可能写坏数据），或模型反复收到“参数错误”而重试 | 高 | P0 | 实施前：`llm.py:209-277`（解析在 `263-266`）、`agent.py:153-168`、`mcp.py:206-207`；现状：`llm.py:38,235,250-252,319`；`agent.py:26,114-119,151-161` |
 | M3（v1.3 已实施） | 上下文超限无兜底 | 长会话突然报 `maximum context length`，本轮失败且不会自动恢复 | 高 | P1 | 实施前：`agent.py:73,76,122`、`context.py:28-45,52-54,142-157`、`llm.py:180-190`；现状：`llm.py:108-120`；`context.py:56-86,152`；`agent.py:78-82,84-107,149` |
-| M4 | 工具结果无统一治理 | 一次大输出挤爆上下文；密钥回显进入历史并可能被 `/save` 落盘 | 中高 | P1 | `agent.py:153-168`；`read.py:34-53`；`mcp.py:107-119` |
+| M4（v1.4 已实施） | 工具结果无统一治理 | 一次大输出挤爆上下文；密钥回显进入历史并可能被 `/save` 落盘 | 中高 | P1 | 实施前：`agent.py:153-168`、`read.py:34-53`；现状：`agent.py:43,49,253-269,371-383`；`read.py:8,41-48` |
 
 > 严重度衡量“用户是否会拿到错误结果或丢失数据”；优先级衡量“本轮实施顺序”。M1/M2 为 P0，因为它们在默认参数下就可能发生，且后果是会话不可用或副作用错误。
 
@@ -557,7 +560,7 @@ M2 按 4.c 实施后，对同一批改动做了两轮生产级复核，判定出
 
 **连带修正 R4（并行覆盖真空）。** 组 1–7 全部是单条 `tool_call` 的轮次，走的都是 `_execute_round` 的 `len == 1` 分支，`_exec_tools_parallel` 里新增的短路表达式从未被任何用例执行过——新加的防线自己无人守着。补组 8 `TestParallelBatch`（`tests/test_agent_loop_hardening.py:378`）：同一轮混合一个合法调用与一个坏 JSON 调用，断言合法的执行、坏的不执行、pre/post hook 只对合法调用触发、tool 回复按 id 对齐。其中 `pre == ["good"]` 是关键断言——它把并行分支的短路与 `_exec_tool` 的第二道防线区分开，删掉前者用例即红。
 
-**回归测试与现状。** `tests/test_agent_loop_hardening.py` 现为 11 组（组 10 为 v1.2 追加的 M1 用例，组 11 为 v1.3 追加的 M3 用例）：
+**回归测试与现状。** `tests/test_agent_loop_hardening.py` 现为 12 组（组 10 为 v1.2 追加的 M1 用例，组 11 为 v1.3 追加的 M3 用例，组 12 为 v1.4 追加的 M4 用例）：
 
 | 组 | 位置（类定义起始行，v1.2 实测） | 覆盖 |
 |---|---|---|
@@ -572,8 +575,9 @@ M2 按 4.c 实施后，对同一批改动做了两轮生产级复核，判定出
 | 9 | `419` | R5 `max_rounds=1` 下截断仍抛 |
 | 10 | `452` | M1（v1.2）：逃逸异常回填（`on_tool` 崩溃 / `ask` 崩溃 / 工具抛 `BaseException` / 并行整批 / 成功路径 no-op） |
 | 11 | `590` | M3（v1.3）：context 400 强制压缩并重试一次、第二次失败原样抛、非 context 400 不重试、短历史不压缩、固定开销计入 snip 阈值、agent 传参 |
+| 12 | `717` | M4（v1.4）：长结果封顶、头尾保留、四类密钥脱敏、`read_file` 超大文件拒绝、MCP 形状结果封顶、并行结果独立封顶 |
 
-全量 `pytest -q` 为 **251 passed / 1 skipped**（v1.3 实测，含组 11 的 6 条；v1.2 记为 245 passed / 1 skipped，差额即本次新增用例）；改动文件 `ruff check` 通过。附录 A.2 的探针仍有效，但它只验证 M2 本体（截断轮不执行），不覆盖 R1/R2；复核 R1/R2 请直接跑上述用例。
+全量 `pytest -q` 为 **257 passed / 1 skipped**（v1.4 实测，含组 12 的 6 条；v1.3 记为 251 passed / 1 skipped，差额即本次新增用例）；改动文件 `ruff check` 通过。附录 A.2 的探针仍有效，但它只验证 M2 本体（截断轮不执行），不覆盖 R1/R2；复核 R1/R2 请直接跑上述用例。
 
 ## 5. M3 上下文超限无兜底
 
@@ -736,6 +740,8 @@ PASS the provider rejection was absorbed by one forced collapse and one retry.
 
 ## 6. M4 工具结果无统一治理
 
+> **状态（v1.4）：已实施。** 落点：`corecoder/agent.py:43,49`（`max_tool_result_chars`）、`agent.py:253-269`（`_exec_tool` 包装与 `_govern_result`）、`agent.py:371-383`（`_REDACTIONS`/`_redact`）、`corecoder/tools/read.py:8,41-48`（`_MAX_FILE_BYTES` 与大小检查）。用例组 12（6 条，`tests/test_agent_loop_hardening.py:717`）。实测：组 12 `6 passed`，全量 `257 passed / 1 skipped`，`ruff` 通过，`--demo` 退出 0；真实 provider 脚本见 6.e。6.a 的问题行号是修复前存档，当前行号以本状态头与 6.c 为准。
+
 ### 6.a 问题现状
 
 **先讲后果。** 工具输出是原样塞回对话的。不同工具自己截断的长度不一样，有的干脆不截：`read_file` 只限制“2000 行”，但一行可以很长，文件还会被整个读进内存；MCP 返回多少就收多少。于是一次读大文件或一次远端调用就能把上下文塞满，用户看到 agent“突然失忆”（其实是压缩把早期对话摘掉了）。另外，命令输出里如果带 API key，会原样进入历史，`/save` 还会写到磁盘。
@@ -810,56 +816,47 @@ PASS the provider rejection was absorbed by one forced collapse and one retry.
 
 ### 6.c 具体实施
 
-**最小可行改动（M4-min）。**
+**已实施内容（M4-min，v1.4 实测）。**
 
-1. `corecoder/agent.py`
-   - `Agent.__init__` 增加 `max_tool_result_chars: int = 15000`。
-   - 新增：
+1. `corecoder/agent.py:43,49`
+   - `Agent.__init__` 新增 `max_tool_result_chars: int = 15_000` 并保存为实例属性；默认值与 bash 现有口径一致。
 
-```python
-def _govern_result(self, result: str) -> str:
-    text = result if isinstance(result, str) else str(result)
-    limit = self.max_tool_result_chars
-    if len(text) > limit:
-        head = text[: limit * 2 // 3]
-        tail = text[-(limit // 3):]
-        text = (f"{head}\n... (truncated: {len(text)} chars total, "
-                f"showing first {len(head)} and last {len(tail)}) ...\n{tail}")
-    return _redact(text)
-```
+2. `corecoder/agent.py:253-269`
+   - 原 `_exec_tool` 改名为 `_exec_tool_raw`（未知工具、坏参数、bind 失败、工具异常、正常结果五个返回点保持不变）。
+   - 新 `_exec_tool` 只做一层包装：`return self._govern_result(self._exec_tool_raw(tc))`。因此单条路径与并行路径（`_exec_tools_parallel` 的 worker 调用的仍是 `_exec_tool`）的所有出口都自动经过治理。
+   - `_govern_result`：超过 `max_tool_result_chars` 时保留头 `limit * 2 // 3`、尾 `limit - head`，中间插入 `... (truncated: N chars total, showing first X and last Y) ...`；先封顶再脱敏，避免截断把密钥切成两半导致漏检。
 
-   - `_exec_tool` 的每个返回出口统一经过 `_govern_result`（未知工具、参数错误、执行异常、正常结果）；实现上可把现有逻辑改名为 `_exec_tool_raw`，`_exec_tool` 只做治理包装。
+3. `corecoder/agent.py:371-383`
+   - 模块级 `_REDACTIONS`（四条正则）与 `_redact(text)`，按顺序替换：OpenAI key、Bearer、AWS key、PEM 私钥。规则与 6.b 的设计一致；未做 `try/except` 回退，因为正则是静态的，不存在运行期编译失败。
 
-2. 新增模块级 `_redact(text: str) -> str`（可放在 `agent.py` 或新文件 `corecoder/redact.py`；为控制改动面，建议放在 `agent.py` 底部，后续再抽离）。
+4. `corecoder/tools/read.py:8,41-48`
+   - 模块常量 `_MAX_FILE_BYTES = 10 * 1024 * 1024`。
+   - `execute` 在 `is_file()` 之后、`read_text` 之前检查 `p.stat().st_size`，超限返回 `Error: file too large (...)` 并提示改用 `offset/limit` 或 grep。这样超大文件不会被整个读进内存。
 
-3. `corecoder/tools/read.py`
-   - 增加模块常量 `_MAX_FILE_BYTES = 10 * 1024 * 1024`。
-   - `execute` 在 `read_text` 之前检查 `p.stat().st_size`，超限返回 `Error: file too large (...)`。
+**控制流与数据流。** 工具原始输出 → `_govern_result`（封顶 → 脱敏）→ 写入历史。post-hook 收到的是治理后的文本，这是 M4 的安全优先取舍；原文审计需要 M4-full 的 `ToolResult.raw_text`，仍留在第 9 节。
 
-**控制流与数据流。** 工具原始输出 → `_govern_result`（封顶 → 脱敏）→ 写入历史；post-hook 在 `agent.py:100` / `213-214` 收到的是治理后的文本（安全优先的取舍；若需要原文审计，见完整版）。
+**未改动。** `mcp.py` 不做单独封顶：治理在 loop 出口统一完成，MCP 与其他工具走同一条路径。`bash/fetch/edit/grep/子 agent` 的各自上限保留，作为更早的一道收敛。
 
-**异常处理与回滚。** 治理是纯函数，不改变工具执行结果的成功/失败语义；脱敏正则若抛异常（概率极低），应回退为原文并继续（最小版本可用 `try/except` 包一层）。回滚 revert `agent.py` 与 `read.py`。
+**向后兼容。** 默认上限 15000；短结果逐字节不变；既有 `Edited` / `Wrote` / `Error` 前缀断言不受影响；`max_tool_result_chars` 是新增关键字参数，放在参数表末尾。
 
-**向后兼容。** 默认上限 15000；短结果逐字节不变；既有测试断言的 `Edited` / `Wrote` / `Error` 前缀不受影响。
+**回滚点。** `git revert <M4 commit>`，同时回滚 `corecoder/agent.py`、`corecoder/tools/read.py`、组 12 与 `examples/m4_tool_result_governance.py`。
 
-**验收标准。** 长结果被截断且头尾保留；密钥被替换；`read_file` 对超大文件返回错误；并行批次每条结果独立治理。
-
-**完整生产化改动（M4-full）。**
-
-- 引入 `ToolResult` 数据类，`raw_text` 供 post-hook 审计，`display_text` 用于历史。
-- `mcp.py` 的 `_read_loop` 对单行长度设上限，避免 `json.loads` 之前就吃满内存。
-- 脱敏规则可配置（`~/.corecoder/redaction.json`），并记录命中次数。
+**未纳入 M4-full。** 结构化 `ToolResult`（`raw_text` 供审计）、MCP `_read_loop` 的单行上限、可配置脱敏规则与命中计数，均属架构级/可观测性改动，本轮不做（见第 9 节）。
 
 ### 6.d 测试方案
 
-| 用例名 | 构造与失败注入 | 断言点 |
-|---|---|---|
-| `test_long_result_is_clamped_before_history` | 工具返回 100_000 字符 | 历史中该 tool 消息长度 ≤ 15000 + marker 余量；含 `truncated` |
-| `test_clamp_preserves_head_and_tail` | 返回 `HEAD...TAIL` 结构的长文本 | 结果以 `HEAD` 开头、以 `TAIL` 结尾 |
-| `test_secret_is_redacted_in_tool_message` | 返回 `sk-` + 32 位、`Bearer abcdefgh` | 历史中不含原始串；含 `[REDACTED` |
-| `test_read_file_rejects_oversized_file` | monkeypatch `read._MAX_FILE_BYTES = 1024`，写 2048 字节文件 | 返回 `Error: file too large` |
-| `test_mcp_tool_result_is_clamped` | fake `MCPTool` 返回 100_000 字符 | 同第一条 |
-| `test_parallel_results_are_clamped_independently` | 两个调用各返回 100_000 字符 | 两条 tool 消息都被截断 |
+组 12 `TestToolResultGovernance`（`tests/test_agent_loop_hardening.py:717`）共 6 条，全部走真实 `Agent.chat()` 与真实 `_exec_tool`，用 `FixedOutputTool` / `McpShapedTool` 控制返回内容。
+
+| # | 用例名 | 构造与失败注入 | 断言点 | 先红时的实际失败原因 |
+|---|---|---|---|---|
+| 1 | `test_long_result_is_clamped_before_history` | 工具返回 `"x" * 100_000` | tool 消息长度 ≤ 15200；含 `truncated:` | `assert 100000 <= 15200` |
+| 2 | `test_clamp_preserves_head_and_tail` | 返回 `"HEAD\n" + "x"*100_000 + "\nTAIL"` | 以 `HEAD` 开头、以 `TAIL` 结尾、含 `truncated:` | 头尾成立，但没有 `truncated:` |
+| 3 | `test_secret_is_redacted_in_tool_message` | 返回 OpenAI key、`Bearer abcdefghij`、AWS `AKIA...`、PEM 私钥 | 四个原始串均不在历史；`[REDACTED` 出现 4 次 | 原始串全在，无 `[REDACTED` |
+| 4 | `test_read_file_rejects_oversized_file` | monkeypatch `read._MAX_FILE_BYTES = 1024`，写 2048 字节 | 返回含 `Error: file too large` | 返回了文件内容（常量未被使用） |
+| 5 | `test_mcp_tool_result_is_clamped` | `execute(**kwargs)` 形状的 `mcp__fake__big` 返回 100_000 字符 | 同 #1 | `assert 100000 <= 15200` |
+| 6 | `test_parallel_results_are_clamped_independently` | 同一轮两个调用各返回 100_000 字符 | 两条 tool 消息都 ≤ 15200 且都含 marker | 两条都是 100000，无 marker |
+
+**先红实测（v1.4）：6 红 0 绿**，失败原因与上表一致。
 
 运行：
 
@@ -867,38 +864,43 @@ def _govern_result(self, result: str) -> str:
 .venv\Scripts\python.exe -m pytest tests/test_agent_loop_hardening.py -k "clamp or redact or oversized" -v
 ```
 
+**先绿实测（v1.4）**：`6 passed, 26 deselected`；随后全量 `257 passed, 1 skipped`（24.49s），`ruff check corecoder tests examples/m4_tool_result_governance.py` 输出 `All checks passed!`；`python -m corecoder --demo` 退出码 0。
+
 ### 6.e 人工验证
 
-前置条件：同 M1，不需要 API key。
+离线探针仍保留在附录 A.4（不依赖 API key）。v1.4 增加了真实 provider 脚本 `examples/m4_tool_result_governance.py`（已用 `git add -f` 入库，`.gitignore` 规则保持不变），分三段：
 
-步骤（cmd）：
+1. 真实 `read_file` 读取 600,037 字节文件，要求模型实际调用工具；检查封顶、marker、头尾保留。
+2. 真实 `read_file` 读取含四类假密钥的文件；检查原始串全部消失、`[REDACTED` 出现。
+3. 不调用 API，直接用 `ReadFileTool` 读 11 MB 文件；检查返回 `Error: file too large`。
 
-1. `cd /d D:\github\CoreCoder`
-2. 创建 `%TEMP%\cc_m4_probe.py`，内容见附录 A.4。
-3. `.venv\Scripts\python.exe "%TEMP%\cc_m4_probe.py"`
-
-预期输出（修复后）：
-
-```text
-stored length: <= 15000 (plus marker)
-contains truncated marker: True
-raw key present: False
-redacted marker present: True
-head preserved: True
-tail preserved: True
-```
-
-失败注入：把 `max_tool_result_chars` 设为 1_000_000 再跑，应看到 `contains truncated marker: False`，证明探针确实在测截断路径。
-
-清理：`del "%TEMP%\cc_m4_probe.py"`
-
-冒烟（可选，不需要真实 API key）：
+运行（仓库根目录，显式加载 `.env` 的 `OPENAI_API_KEY` / `CORECODER_MODEL`）：
 
 ```bat
-.venv\Scripts\python.exe -m corecoder --demo
+.venv\Scripts\python.exe examples\m4_tool_result_governance.py
+.venv\Scripts\python.exe examples\m4_tool_result_governance.py --max-result-chars 1000000
+.venv\Scripts\python.exe examples\m4_tool_result_governance.py --no-redact
 ```
 
-PyCharm：Script path 指向 `%TEMP%\cc_m4_probe.py`，Working directory 为仓库根目录。
+**实测 1（默认）**：
+
+```text
+stored length: 15076
+contains truncated marker: True
+head preserved: True
+tail preserved: True
+raw secret markers in history: 0/4
+redacted marker present: True
+oversized rejected: True
+history valid: True
+PASS all checks matched the configured mode (clamp on, redact on).
+```
+
+**实测 2（`--max-result-chars 1000000`，夹具 600 KB < 1 MB，封顶确实不触发）**：`stored length: 600041`、`contains truncated marker: False`，其余为 True。这证明脚本确实覆盖了封顶路径，而不是只跑一个恒为真的断言。
+
+**实测 3（`--no-redact`，运行期把 `corecoder.agent._redact` 替换为恒等函数）**：`raw secret markers in history: 4/4`、`redacted marker present: False`，其余为 True。这证明脱敏阶段确实在检查 `_redact`。
+
+退出码：0 全部判定通过；1 任一判定失败；2 缺 key 或模型没有实际读取目标文件（脚本对模型噪声最多重试 3 次，仍失败则退出 2；换模型或重跑即可）。脚本在系统临时目录创建夹具并保留，输出中打印了 `rm -rf` 清理命令。
 
 ## 7. 追踪矩阵
 
@@ -909,11 +911,11 @@ PyCharm：Script path 指向 `%TEMP%\cc_m4_probe.py`，Working directory 为仓�
 | R1 | `llm.py:270-292`；`agent.py:159-161,180-196,225-234,263-265` | 坏参数三处短路，先于 hooks 与权限 | 组 6（4 条） | 无独立探针，直接跑组 6（见 4.f.1） |
 | R2 | `agent.py:25-29,95-101,126-133`；`cli.py:159-162,334-336` | 终止信号改为抛 `TruncatedOutput`，三个调用方各自接线（含 R4、R5） | 组 3、7、8、9（6 条） | 无独立探针，直接跑组 7（见 4.f.2） |
 | M3（已实施） | 实施前 `llm.py:112-117,180-190`、`context.py:56-76,142-157`、`agent.py:73,76,122`；现状 `llm.py:108-120`、`context.py:56-86,152`、`agent.py:78-82,84-107,149` | 已实施：超限识别 + 强制压缩重试一次 + 固定开销计入估算 | 组 11（6 条，类定义于 `tests/test_agent_loop_hardening.py:590`） | 附录 A.3 探针；`examples/m3_context_overflow.py`（真实 provider，见 5.e） |
-| M4 | `agent.py:153-168`；`read.py:34-53` | 出口治理 + 文件大小上限 | 6 条 clamp/redact/oversized 用例 | 附录 A.4 探针 |
+| M4（已实施） | 实施前 `agent.py:153-168`、`read.py:34-53`；现状 `agent.py:43,49,253-269,371-383`、`read.py:8,41-48` | 已实施：`_exec_tool` 出口统一封顶 + 脱敏；`read_file` 文件大小上限 | 组 12（6 条，类定义于 `tests/test_agent_loop_hardening.py:717`） | 附录 A.4 探针；`examples/m4_tool_result_governance.py`（真实 provider，见 6.e） |
 
 ## 8. 实施顺序、DoD 与回滚
 
-三步，按“止血 → 防线 → 治理”推进。每步独立提交，失败可单独 revert。**第一步（M1）、第二步（M2）与第三步的 M3 均已完成，仅剩 M4 待实施。**
+三步，按“止血 → 防线 → 治理”推进。每步独立提交，失败可单独 revert。**三步均已实施完成：M1（v1.2）、M2（v1.1）、M3（v1.3）、M4（v1.4）。**
 
 ### 第一步：M1（P0，止血）——已完成
 
@@ -960,12 +962,20 @@ PyCharm：Script path 指向 `%TEMP%\cc_m4_probe.py`，Working directory 为仓�
 - 提交：`fix(context): recover from context-length rejection`（代码、组 11、脚本与本文件 v1.3 在同一提交）。
 - 回滚点：`git revert <M3 commit>`（不改 `.gitignore`）。
 
-**M4**
+**M4——已完成（v1.4）**
 
-- 改动文件：`corecoder/agent.py`、`corecoder/tools/read.py`
-- 依赖：无（但建议在 M1 之后，便于异常路径统一处理）。
-- DoD：6 条 M4 用例通过；附录 A.4 探针全部为 True；`--demo` 正常。
-- 回滚点：revert 两个文件。
+- 改动文件：`corecoder/agent.py`、`corecoder/tools/read.py`、`tests/test_agent_loop_hardening.py`（组 12）、`examples/m4_tool_result_governance.py`
+- 依赖：无（但放在最后，避免“每条工具结果都变文本”的改动干扰 M3 的失败路径验证）。
+- 内容：`_exec_tool` 出口统一封顶与脱敏 + `read_file` 文件大小上限；详见 6.c。
+- DoD（v1.4 实测）：
+  - [x] 组 12 的 6 条 M4 用例通过（`6 passed, 26 deselected`，`-k "clamp or redact or oversized"`）。
+  - [x] 全量 `pytest -q` 通过：`257 passed, 1 skipped`（既有用例无回归）。
+  - [x] `ruff check corecoder tests examples/m4_tool_result_governance.py`：`All checks passed!`。
+  - [x] 附录 A.4 探针全部为 True。
+  - [x] `python -m corecoder --demo` 退出码 0。
+  - [x] `examples/m4_tool_result_governance.py` 默认模式：`stored length: 15076`、`contains truncated marker: True`、`raw secret markers in history: 0/4`、`redacted marker present: True`、`oversized rejected: True`、`history valid: True`；`--max-result-chars 1000000` 与 `--no-redact` 两个注入模式也各自按预期翻转（见 6.e）。
+- 提交：`fix(agent): clamp and redact tool results`（代码、组 12、脚本与本文件 v1.4 在同一提交）。
+- 回滚点：`git revert <M4 commit>`（不改 `.gitignore`）。
 
 ### 提交建议
 
@@ -973,7 +983,7 @@ PyCharm：Script path 指向 `%TEMP%\cc_m4_probe.py`，Working directory 为仓�
 fix(agent): always backfill tool replies on any exception   # M1 已完成 ✔ d05e853
 fix(llm): detect truncated tool calls via finish_reason    # M2（含 R1/R2）
 fix(context): recover from context-length rejection        # M3 已完成 ✔
-fix(agent): clamp and redact tool results                  # M4
+fix(agent): clamp and redact tool results                  # M4 已完成 ✔
 ```
 
 顺序提交，便于逐项回滚与二分定位。
@@ -1027,20 +1037,24 @@ git grep -n "context_length" corecoder tests
 git grep -n "max_rounds" tests
 ```
 
-**v1.3 实测预期**（`git grep -c` 逐文件）：
+**v1.4 实测预期**（`git grep -c` 逐文件）：
 
 | 关键词 | 预期 | 说明 |
 |---|---|---|
 | `finish_reason` | `corecoder/llm.py` 6 处、`corecoder/agent.py` 1 处、测试 36 处 | 已实现（M2） |
 | `arguments_error` | `corecoder/llm.py` 2 处、`corecoder/agent.py` 1 处 | 已实现（R1） |
 | `TruncatedOutput` | `corecoder/agent.py` 3 处、`corecoder/cli.py` 3 处、`corecoder/__init__.py` 2 处、测试 6 处 | 已实现（R2）；三处接线缺一处即静默失败回归 |
-| `context_length` | `corecoder/agent.py` 2 处、`corecoder/llm.py` 2 处 | **已实现（M3，v1.3）**：不再是 0 命中 |
+| `context_length` | `corecoder/agent.py` 2 处、`corecoder/llm.py` 2 处 | 已实现（M3，v1.3） |
 | `force_collapse` | `corecoder/context.py` 1 处、`corecoder/agent.py` 1 处、测试 1 处 | M3 新增的公共强制压缩入口 |
 | `fixed_tokens` | `corecoder/context.py` 5 处、`corecoder/agent.py` 2 处、测试 2 处 | M3 的固定开销估算；若 agent 侧为 0，说明未计入固定开销 |
+| `max_tool_result_chars` | `corecoder/agent.py` 3 处 | **已实现（M4，v1.4）**：构造参数、实例属性、封顶判断 |
+| `_govern_result` | `corecoder/agent.py` 2 处 | **M4 的唯一治理出口**；若 `_exec_tool` 不调用它，封顶与脱敏都不会发生 |
+| `_redact` | `corecoder/agent.py` 2 处（含 `_REDACTIONS` 定义行）、测试 1 处 | M4 脱敏；测试命中处是 `--no-redact` 的 patch 目标 |
+| `_MAX_FILE_BYTES` | `corecoder/tools/read.py` 3 处、测试 1 处 | M4 的 `read_file` 大小上限 |
 | `max_rounds` | `tests/test_live_smoke.py` 1 处、`tests/test_agent_loop_hardening.py` 3 处（组 3 的 `max_rounds=10`、组 9 的 `max_rounds=1`、一处注释） | **注意：`git grep` 只搜已跟踪文件**。两文件共 4 处；若只命中 1 处，先确认测试文件是否被忽略 |
 | `except KeyboardInterrupt` | `corecoder/agent.py` 0 处 | **M1 实施的直接标志**：v1.0 这里命中 1 处（仅 Ctrl+C 回填）；v1.2 起改为 `try/finally`，因此 0 命中 |
 
-v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder` 下为 0 命中；`max_rounds` 在离线测试中为 0 命中”。M2、R1/R2 与 M3 实施后，`finish_reason` / `arguments_error` / `TruncatedOutput` / `context_length` 都不再是 0。
+v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder` 下为 0 命中；`max_rounds` 在离线测试中为 0 命中”。M2、R1/R2、M3 与 M4 实施后，表中所有“实现类”关键词都不再是 0。
 
 ### 10.3 provider 的 context-length 文案
 
@@ -1059,6 +1073,8 @@ v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder
 **v1.2**：M1 实施后重新实测为 `agent.py` 322 行、`llm.py` 378 行、`cli.py` 400 行、`tests/test_agent_loop_hardening.py` 550 行。第 3 节的行号已按本次实测更新（3.a 的触发条件表与真实执行路径仍保留 v1.0 值，那是对问题现状的存档）；第 5、6 节以及 4.a–4.e 的行号仍是 v1.0 的写作时值，实施前必须重新定位。
 
 **v1.3**：M3 实施后重新实测为 `agent.py` 345 行、`context.py` 230 行、`llm.py` 392 行、`cli.py` 400 行、`tests/test_agent_loop_hardening.py` 681 行。第 5 节与 4.f.2 的组表已按本次实测更新；第 6 节（M4）与 4.a–4.e 的行号仍是 v1.0 的写作时值，实施 M4 前必须按 10.2 重新定位。
+
+**v1.4**：M4 实施后重新实测为 `agent.py` 383 行、`context.py` 230 行、`llm.py` 392 行、`cli.py` 400 行、`tools/read.py` 64 行、`tests/test_agent_loop_hardening.py` 824 行。第 6 节、第 7 节与 4.f.2 的组表已按本次实测更新；3.a 与 4.a–4.e 的修复前存档行号保持不变。
 
 ## 附录 A：人工验证探针
 

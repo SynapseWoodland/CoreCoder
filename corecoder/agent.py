@@ -12,6 +12,7 @@ which means it's done working and ready to report back.
 import concurrent.futures
 import inspect
 import json
+import re
 
 from .context import ContextManager, estimate_tokens
 from .llm import LLM, is_context_length_error
@@ -39,11 +40,13 @@ class Agent:
         max_rounds: int = 50,
         permission=None,
         hooks=None,
+        max_tool_result_chars: int = 15_000,
     ):
         self.llm = llm
         self.tools = tools if tools is not None else ALL_TOOLS
         self.permission = permission
         self.hooks = hooks
+        self.max_tool_result_chars = max_tool_result_chars
         self._tool_by_name = {t.name: t for t in self.tools}
         self.messages: list[dict] = []
         self.context = ContextManager(max_tokens=max_context_tokens)
@@ -248,7 +251,25 @@ class Agent:
         return self.permission.check(tc.name, tc.arguments)
 
     def _exec_tool(self, tc) -> str:
-        """Execute a single tool call, returning the result string."""
+        """Execute one tool call and govern its result before it hits history."""
+        return self._govern_result(self._exec_tool_raw(tc))
+
+    def _govern_result(self, result: str) -> str:
+        """Clamp and redact a tool result: the single exit for every path."""
+        limit = self.max_tool_result_chars
+        if len(result) > limit:
+            head = limit * 2 // 3
+            tail = limit - head
+            result = (
+                result[:head]
+                + f"\n... (truncated: {len(result)} chars total, "
+                  f"showing first {head} and last {tail}) ...\n"
+                + result[-tail:]
+            )
+        return _redact(result)
+
+    def _exec_tool_raw(self, tc) -> str:
+        """Execute a single tool call, returning the raw result string."""
         tool = self._tool_by_name.get(tc.name)
         if tool is None:
             return f"Error: unknown tool '{tc.name}'"
@@ -343,3 +364,20 @@ class Agent:
         todo = self._tool_by_name.get("todo_write")
         if isinstance(todo, TodoWriteTool):
             todo._tasks = []
+
+
+# Secrets that most often leak through command output or remote tool results.
+# Kept as whole-token patterns so ordinary words survive the pass.
+_REDACTIONS = (
+    (re.compile(r"sk-[A-Za-z0-9_-]{16,}"), "[REDACTED:api_key]"),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{8,}", re.IGNORECASE), "Bearer [REDACTED]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED:aws_key]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+     "[REDACTED:private_key]"),
+)
+
+
+def _redact(text: str) -> str:
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text

@@ -5,6 +5,8 @@ from typing import ClassVar
 
 from .base import Tool
 
+_MAX_FILE_BYTES = 10 * 1024 * 1024
+
 
 class ReadFileTool(Tool):
     name = "read_file"
@@ -38,6 +40,12 @@ class ReadFileTool(Tool):
                 return f"Error: {file_path} not found"
             if not p.is_file():
                 return f"Error: {file_path} is a directory, not a file"
+            size = p.stat().st_size
+            if size > _MAX_FILE_BYTES:
+                return (
+                    f"Error: file too large ({size} bytes, limit {_MAX_FILE_BYTES}); "
+                    "read a range with offset/limit or inspect it with grep"
+                )
 
             text = p.read_text(encoding="utf-8", errors="replace")
             lines = text.splitlines()

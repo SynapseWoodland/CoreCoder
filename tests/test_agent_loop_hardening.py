@@ -9,6 +9,8 @@ visible to the REPL, to one-shot mode and to a sub-agent. Group 10 pins M1:
 any exception escaping a round must still leave every tool_call answered.
 Group 11 pins M3: a provider context-length 400 collapses the history once
 and retries once, and the local estimate counts the fixed request overhead.
+Group 12 pins M4: every tool result is clamped and redacted before it enters
+the history, and read_file refuses oversized files.
 """
 
 from types import SimpleNamespace
@@ -679,3 +681,144 @@ class TestContextOverflowRecovery:
 
         assert compress.call_count == 1
         assert compress.call_args.kwargs["fixed_tokens"] > 0
+
+
+# ─── 12. M4: tool results are clamped and redacted before history ───────────
+
+class FixedOutputTool(Tool):
+    """A tool that returns one fixed string, so tests can size the result."""
+
+    description = "returns a fixed string"
+    parameters: ClassVar[dict] = {"type": "object", "properties": {}}
+
+    def __init__(self, name: str, output: str):
+        self.name = name
+        self.output = output
+
+    def execute(self) -> str:
+        return self.output
+
+
+class McpShapedTool(Tool):
+    """MCP tools take **kwargs, which binds anything, including {}."""
+
+    name = "mcp__fake__big"
+    description = "returns a fixed large string"
+    parameters: ClassVar[dict] = {"type": "object", "properties": {}}
+
+    def execute(self, **kwargs) -> str:
+        return "m" * 100_000
+
+
+def _tool_replies(messages: list[dict]) -> list[str]:
+    return [m["content"] for m in messages if m.get("role") == "tool"]
+
+
+class TestToolResultGovernance:
+    """Tool output used to enter the history verbatim: read_file and MCP had no
+    size cap at all, and no path redacted secrets. The loop exit must clamp and
+    redact every result, whichever tool produced it."""
+
+    def test_long_result_is_clamped_before_history(self):
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[ToolCall(id="t1", name="big", arguments={})]),
+                LLMResponse(content="done"),
+            ]),
+            tools=[FixedOutputTool("big", "x" * 100_000)],
+        )
+
+        assert agent.chat("go") == "done"
+
+        [reply] = _tool_replies(agent.messages)
+        assert len(reply) <= 15_200
+        assert "truncated:" in reply
+
+    def test_clamp_preserves_head_and_tail(self):
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[ToolCall(id="t1", name="big", arguments={})]),
+                LLMResponse(content="done"),
+            ]),
+            tools=[FixedOutputTool("big", "HEAD\n" + "x" * 100_000 + "\nTAIL")],
+        )
+
+        assert agent.chat("go") == "done"
+
+        [reply] = _tool_replies(agent.messages)
+        assert reply.startswith("HEAD")
+        assert reply.endswith("TAIL")
+        assert "truncated:" in reply
+
+    def test_secret_is_redacted_in_tool_message(self):
+        openai_key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+        bearer = "Bearer abcdefghij"
+        aws_key = "AKIAABCDEFGHIJKLMNOP"
+        private_key = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEsecretmaterialthatmustnotreachdisk\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        output = f"{openai_key}\n{bearer}\n{aws_key}\n{private_key}"
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[ToolCall(id="t1", name="secrets", arguments={})]),
+                LLMResponse(content="done"),
+            ]),
+            tools=[FixedOutputTool("secrets", output)],
+        )
+
+        assert agent.chat("go") == "done"
+
+        [reply] = _tool_replies(agent.messages)
+        for raw in (openai_key, "abcdefghij", aws_key, "MIIEsecretmaterialthatmustnotreachdisk"):
+            assert raw not in reply
+        assert reply.count("[REDACTED") == 4
+
+    def test_read_file_rejects_oversized_file(self, tmp_path, monkeypatch):
+        from corecoder.tools.read import ReadFileTool
+
+        monkeypatch.setattr("corecoder.tools.read._MAX_FILE_BYTES", 1024, raising=False)
+        path = tmp_path / "big.txt"
+        path.write_bytes(b"x" * 2048)
+
+        result = ReadFileTool().execute(file_path=str(path))
+
+        assert "Error: file too large" in result
+
+    def test_mcp_tool_result_is_clamped(self):
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[ToolCall(
+                    id="t1", name="mcp__fake__big", arguments={},
+                )]),
+                LLMResponse(content="done"),
+            ]),
+            tools=[McpShapedTool()],
+        )
+
+        assert agent.chat("go") == "done"
+
+        [reply] = _tool_replies(agent.messages)
+        assert len(reply) <= 15_200
+        assert "truncated:" in reply
+
+    def test_parallel_results_are_clamped_independently(self):
+        agent = Agent(
+            llm=ScriptedLLM([
+                LLMResponse(tool_calls=[
+                    ToolCall(id="t1", name="big", arguments={}),
+                    ToolCall(id="t2", name="big", arguments={}),
+                ]),
+                LLMResponse(content="done"),
+            ]),
+            tools=[FixedOutputTool("big", "x" * 100_000)],
+        )
+
+        assert agent.chat("go") == "done"
+
+        replies = _tool_replies(agent.messages)
+        assert len(replies) == 2
+        for reply in replies:
+            assert len(reply) <= 15_200
+            assert "truncated:" in reply
