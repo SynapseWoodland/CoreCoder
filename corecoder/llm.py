@@ -16,6 +16,8 @@ from pathlib import Path
 
 from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, OpenAI, RateLimitError
 
+from .observability import log_event
+
 
 @dataclass
 class ToolCall:
@@ -119,23 +121,29 @@ def is_context_length_error(exc: BaseException) -> bool:
     return any(hint in message for hint in _CONTEXT_ERROR_HINTS)
 
 
-def _adapt_rejected_param(params: dict, exc: BadRequestError) -> bool:
+def _adapt_rejected_param(params: dict, exc: BadRequestError) -> str | None:
     """Translate or drop one parameter a provider rejected with a 400.
 
     Newer OpenAI models (gpt-5, o-series) accept only ``max_completion_tokens``
     and the default temperature; the 400 message quotes the offender
     (``'max_tokens'``). Quoted matching is load-bearing: the rejection text
     for ``max_completion_tokens`` must not re-trigger the translation.
-    Returns False when nothing recognizable was rejected.
+    Returns the adapted ``kind``, or None when nothing recognizable was
+    rejected; a non-empty return means "retry with the new params".
     """
     message = str(exc).lower()
     if "'max_tokens'" in message and "max_tokens" in params:
         params["max_completion_tokens"] = params.pop("max_tokens")
-        return True
+        return "max_completion_tokens"
     if "'temperature'" in message and "temperature" in params:
         params.pop("temperature")
-        return True
-    return False
+        return "temperature"
+    return None
+
+
+def _log_retry(stage: str, attempt: int, status, error_type: str) -> None:
+    log_event("llm_retry", stage=stage, attempt=attempt,
+              status=status if status is not None else "", error_type=error_type)
 
 
 class LLM:
@@ -203,11 +211,14 @@ class LLM:
                     stream = self._call_with_retry(params)
                     break
                 except BadRequestError as e:
-                    if _adapt_rejected_param(params, e):
+                    kind = _adapt_rejected_param(params, e)
+                    if kind:
+                        log_event("provider_fallback", kind=kind, attempt=attempt)
                         continue
                     if "stream_options" not in params:
                         raise
                     params.pop("stream_options")
+                    log_event("provider_fallback", kind="stream_options", attempt=attempt)
             try:
                 return self._drain(stream, on_token, on_reasoning)
             except (RateLimitError, APITimeoutError, APIConnectionError) as e:
@@ -223,6 +234,8 @@ class LLM:
             # on_token already showed is simply regenerated. Create-time
             # transients stay inside _call_with_retry and do not land here.
             if attempt < 2:
+                _log_retry("stream", attempt, getattr(last_err, "status_code", None),
+                           type(last_err).__name__)
                 time.sleep(2**attempt)
         raise last_err
 
@@ -324,15 +337,18 @@ class LLM:
         for attempt in range(max_retries):
             try:
                 return self.client.chat.completions.create(**params)
-            except (RateLimitError, APITimeoutError, APIConnectionError):
+            except (RateLimitError, APITimeoutError, APIConnectionError) as e:
                 if attempt == max_retries - 1:
                     raise
                 wait = 2 ** attempt
+                _log_retry("create", attempt, getattr(e, "status_code", None),
+                           type(e).__name__)
                 time.sleep(wait)
             except APIError as e:
                 # retry 5xx server errors but not 4xx; base APIError has no status_code so read it defensively
                 status_code = getattr(e, "status_code", None)
                 if status_code and status_code >= 500 and attempt < max_retries - 1:
+                    _log_retry("create", attempt, status_code, type(e).__name__)
                     time.sleep(2 ** attempt)
                 else:
                     raise
@@ -387,6 +403,8 @@ class LiteLLM(LLM):
                 )
                 is_server = any(kw in err for kw in ["500", "502", "503", "504"])
                 if (is_transient or is_server) and attempt < max_retries - 1:
+                    _log_retry("create", attempt, getattr(e, "status_code", None),
+                               type(e).__name__)
                     time.sleep(2 ** attempt)
                 else:
                     raise

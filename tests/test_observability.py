@@ -1,0 +1,695 @@
+"""TDD tests for the audit layer (item 1).
+
+The audit log must be usable with a single switch (`CORECODER_AUDIT=1`),
+independent of the general `corecoder` log level, and must never change agent
+behaviour: every write failure degrades to silence, and no tool argument,
+result or user input is recorded.
+"""
+
+import io
+import logging
+import os
+import sys
+import time
+from types import SimpleNamespace
+from typing import ClassVar
+from unittest import mock
+
+import pytest
+from openai import APIConnectionError, BadRequestError
+
+from corecoder import observability
+from corecoder.agent import Agent
+from corecoder.context import ContextManager
+from corecoder.demo import ScriptedLLM
+from corecoder.llm import LLM, LiteLLM, LLMResponse, ToolCall
+from corecoder.permissions import Permission
+from corecoder.tools.bash import BashTool
+from corecoder.tools.base import Tool, ToolRefused
+
+
+@pytest.fixture(autouse=True)
+def audit_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("CORECODER_AUDIT", "1")
+    monkeypatch.setenv("CORECODER_AUDIT_FILE", str(tmp_path / "audit.log"))
+    monkeypatch.delenv("CORECODER_AUDIT_STREAM", raising=False)
+    monkeypatch.delenv("CORECODER_AUDIT_MAX_MB", raising=False)
+    observability.reset_audit()
+    yield tmp_path
+    observability.reset_audit()
+
+
+# ─── helpers ────────────────────────────────────────────────────────────────
+
+class SpyTool(Tool):
+    name = "spy"
+    description = "records execution"
+    parameters: ClassVar[dict] = {"type": "object", "properties": {}}
+
+    def __init__(self, result="executed", exc=None, delay=0.0):
+        self.calls: list = []
+        self.result = result
+        self.exc = exc
+        self.delay = delay
+
+    def execute(self) -> str:
+        self.calls.append(1)
+        if self.delay:
+            time.sleep(self.delay)
+        if self.exc is not None:
+            raise self.exc
+        return self.result
+
+
+class WriterTool(SpyTool):
+    name = "writer"
+
+
+class Hooks:
+    def __init__(self, pre=None):
+        self.pre_result = pre
+        self.pre_calls: list = []
+        self.post_calls: list = []
+
+    def run_pre(self, name, arguments):
+        self.pre_calls.append((name, arguments))
+        return self.pre_result
+
+    def run_post(self, name, arguments, result):
+        self.post_calls.append((name, result))
+
+
+def _tc(name="spy", call_id="c1", arguments=None, raw="", error=""):
+    return ToolCall(
+        id=call_id,
+        name=name,
+        arguments=arguments or {},
+        raw_arguments=raw,
+        arguments_error=error,
+    )
+
+
+def _turn(*tool_calls, content=""):
+    return LLMResponse(content=content, tool_calls=list(tool_calls))
+
+
+def _agent(tools, turns, **kwargs):
+    return Agent(llm=ScriptedLLM(turns), tools=tools, **kwargs)
+
+
+def _capture():
+    stream = io.StringIO()
+    observability.configure_audit(stream=stream)
+    return stream
+
+
+def _lines(stream, event=None):
+    lines = [ln for ln in stream.getvalue().splitlines() if ln.startswith("event=")]
+    if event is None:
+        return lines
+    return [ln for ln in lines if ln.startswith(f"event={event} ")]
+
+
+def _fields(line):
+    return dict(token.split("=", 1) for token in line.split() if "=" in token)
+
+
+def _bad_request(message):
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        import httpx2 as httpx
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    return BadRequestError(message, response=httpx.Response(400, request=req), body=None)
+
+
+def _connection_error():
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        import httpx2 as httpx
+    return APIConnectionError(request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"))
+
+
+def _chunk(content):
+    return SimpleNamespace(
+        usage=None,
+        choices=[SimpleNamespace(delta=SimpleNamespace(
+            content=content, tool_calls=None, reasoning_content=None))],
+    )
+
+
+class _DyingStream:
+    def __init__(self, exc):
+        self._exc = exc
+        self._yielded = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._yielded:
+            self._yielded = True
+            return _chunk("part")
+        raise self._exc
+
+
+# ─── 1. the switch is enough ───────────────────────────────────────────────
+
+def test_audit_events_require_only_the_audit_switch(monkeypatch):
+    monkeypatch.delenv("CORECODER_LOG_LEVEL", raising=False)
+    out = _capture()
+    tool = SpyTool()
+    agent = _agent([tool], [_turn(_tc()), _turn(content="done")])
+
+    agent.chat("hi")
+
+    decisions = _lines(out, "tool_decision")
+    results = _lines(out, "tool_result")
+    assert len(decisions) == 1 and _fields(decisions[0])["decision"] == "execute"
+    assert len(results) == 1
+    fields = _fields(results[0])
+    assert fields["effective_decision"] == "execute"
+    assert fields["outcome"] == "ok"
+    assert fields["duration_ms"] != ""
+
+    before = out.getvalue()
+    monkeypatch.setenv("CORECODER_AUDIT", "0")
+    observability.log_event("probe")
+    assert out.getvalue() == before
+
+
+# ─── 2. decision vocabulary and short-circuit order ─────────────────────────
+
+class TestDecisions:
+    def test_bad_arguments_skips_hooks_and_consent(self):
+        hook = Hooks(pre="blocked")
+        consent = mock.Mock(return_value=None)
+        agent = _agent([SpyTool()], [], hooks=hook, permission=Permission(ask=consent))
+        tc = _tc(error="{'cut")
+
+        result, decision = agent._decide(tc)
+
+        assert decision == "bad_arguments"
+        assert "not a valid JSON object" in result
+        assert hook.pre_calls == []
+        consent.assert_not_called()
+
+    def test_pre_hook_blocks_before_consent(self):
+        hook = Hooks(pre="blocked by hook")
+        consent = mock.Mock(return_value=None)
+        agent = _agent([WriterTool()], [], hooks=hook, permission=Permission(ask=consent))
+
+        result, decision = agent._decide(_tc("writer"))
+
+        assert (result, decision) == ("blocked by hook", "pre_hook")
+        consent.assert_not_called()
+
+    def test_plan_mode_blocks_mutating_tools(self):
+        agent = _agent([WriterTool()], [])
+        agent.plan_mode = True
+
+        result, decision = agent._decide(_tc("writer"))
+
+        assert decision == "plan_mode"
+        assert "Plan mode is on" in result
+
+    def test_denied_is_distinct_from_plan_mode(self):
+        agent = _agent([WriterTool()], [], permission=Permission(ask=lambda n, a: "deny"))
+
+        result, decision = agent._decide(_tc("writer"))
+
+        assert decision == "denied"
+        assert "Permission denied" in result
+
+    def test_execute_when_every_gate_passes(self):
+        agent = _agent([WriterTool()], [], permission=Permission(ask=lambda n, a: "once"))
+
+        assert agent._decide(_tc("writer")) == (None, "execute")
+
+
+def test_plan_mode_rule_is_implemented_once():
+    agent = _agent([WriterTool()], [])
+    agent.plan_mode = True
+    original = agent._plan_mode_block
+    agent._plan_mode_block = mock.Mock(wraps=original)
+
+    agent._decide(_tc("writer"))
+    assert agent._plan_mode_block.call_count == 1
+
+    assert agent._permit(_tc("writer")) is not None
+    assert agent._plan_mode_block.call_count == 2
+
+
+# ─── 3. tool outcomes ──────────────────────────────────────────────────────
+
+def test_tool_decision_and_result_are_logged_per_call():
+    out = _capture()
+    agent = _agent([SpyTool()], [_turn(_tc(call_id="abc")), _turn(content="done")])
+
+    agent.chat("hi")
+
+    decision = _fields(_lines(out, "tool_decision")[0])
+    assert decision["tool"] == "spy"
+    assert decision["call_id"] == "abc"
+    assert decision["decision"] == "execute"
+    assert decision["args_chars"] == "0"
+    assert decision["decision_ms"].isdigit()
+
+    result = _fields(_lines(out, "tool_result")[0])
+    assert result["call_id"] == "abc"
+    assert result["chars_in"] == "8"
+    assert result["chars_out"] == "8"
+    assert result["truncated"] == "False"
+    assert result["redacted"] == "False"
+    assert result["error_text"] == "False"
+    assert result["error_type"] == '""'  # empty values are JSON-quoted, not dropped
+
+
+def test_slowest_tool_is_identifiable_and_round_is_omitted_when_unknown():
+    slow = SpyTool(delay=0.12)
+    fast = SpyTool()
+    slow.name = "slow"
+    fast.name = "fast"
+    agent = _agent([slow, fast], [])
+    out = _capture()
+    agent._execute_round(SimpleNamespace(tool_calls=[_tc("slow", "c1"), _tc("fast", "c2")]))
+
+    by_tool = {_fields(ln)["tool"]: _fields(ln) for ln in _lines(out, "tool_result")}
+    assert float(by_tool["slow"]["duration_ms"]) >= 100
+    assert float(by_tool["slow"]["duration_ms"]) > float(by_tool["fast"]["duration_ms"])
+    for line in _lines(out, "tool_result") + _lines(out, "tool_decision"):
+        assert " round=" not in line
+
+
+def test_execute_error_is_distinguished_from_error_text():
+    boom = SpyTool(exc=ValueError("kaboom"))
+    boom.name = "boom"
+    agent = _agent([boom], [])
+    out = _capture()
+
+    agent._execute_round(SimpleNamespace(tool_calls=[_tc("boom", "c1")]))
+
+    result = _fields(_lines(out, "tool_result")[0])
+    assert result["effective_decision"] == "execute"
+    assert result["outcome"] == "error"
+    assert result["error_type"] == "ValueError"
+    assert result["error_text"] == "False"
+
+    missing = SpyTool(result="Error: no such file")
+    missing.name = "missing"
+    agent2 = _agent([missing], [])
+    out2 = _capture()
+    agent2._execute_round(SimpleNamespace(tool_calls=[_tc("missing", "c2")]))
+
+    result = _fields(_lines(out2, "tool_result")[0])
+    assert result["outcome"] == "ok"
+    assert result["error_text"] == "True"
+
+
+def test_refused_denied_and_plan_mode_are_skipped():
+    bash = BashTool()
+    direct = bash.execute(command="rm -rf /")
+    assert isinstance(direct, ToolRefused) and "Blocked" in direct
+
+    out = _capture()
+    agent = _agent([bash], [])
+    agent._execute_round(SimpleNamespace(tool_calls=[
+        _tc("bash", "c1", {"command": "rm -rf /"})]))
+    fields = _fields(_lines(out, "tool_result")[0])
+    assert fields["effective_decision"] == "tool_refused"
+    assert fields["outcome"] == "skipped"
+
+    denied = _agent([WriterTool()], [], permission=Permission(ask=lambda n, a: "deny"))
+    out2 = _capture()
+    denied._execute_round(SimpleNamespace(tool_calls=[_tc("writer", "c2")]))
+    fields = _fields(_lines(out2, "tool_result")[0])
+    assert (fields["effective_decision"], fields["outcome"]) == ("denied", "skipped")
+
+    planned = _agent([WriterTool()], [])
+    planned.plan_mode = True
+    out3 = _capture()
+    planned._execute_round(SimpleNamespace(tool_calls=[_tc("writer", "c3")]))
+    fields = _fields(_lines(out3, "tool_result")[0])
+    assert (fields["effective_decision"], fields["outcome"]) == ("plan_mode", "skipped")
+
+    hooked = _agent([WriterTool()], [], hooks=Hooks(pre="no"))
+    out4 = _capture()
+    hooked._execute_round(SimpleNamespace(tool_calls=[_tc("writer", "c4")]))
+    fields = _fields(_lines(out4, "tool_result")[0])
+    assert (fields["effective_decision"], fields["outcome"]) == ("pre_hook", "skipped")
+
+
+# ─── 4. backfill, truncation and context events ─────────────────────────────
+
+def test_backfill_is_logged_only_when_it_happens():
+    out = _capture()
+    agent = _agent([SpyTool()], [_turn(_tc()), _turn(content="done")])
+    agent.chat("hi")
+    assert _lines(out, "backfill") == []
+
+    class Killer(SpyTool):
+        def execute(self):
+            raise KeyboardInterrupt
+
+    killer = Killer()
+    killer.name = "killer"
+    agent2 = _agent([killer], [_turn(_tc("killer", "c9"), content="")])
+    out2 = _capture()
+    with pytest.raises(KeyboardInterrupt):
+        agent2.chat("go")
+
+    backfills = _lines(out2, "backfill")
+    assert len(backfills) == 1 and _fields(backfills[0])["count"] == "1"
+
+
+def test_truncation_and_max_rounds_are_logged():
+    agent = _agent([SpyTool()], [_turn(_tc(), content="")], max_rounds=3)
+    agent.llm = ScriptedLLM([
+        LLMResponse(content="", tool_calls=[_tc()], finish_reason="length"),
+        LLMResponse(content="", tool_calls=[_tc(call_id="c2")]),
+        LLMResponse(content="done"),
+    ])
+    out = _capture()
+
+    assert agent.chat("hi") == "done"
+    truncated = _lines(out, "output_truncated")
+    assert len(truncated) == 1
+    fields = _fields(truncated[0])
+    assert fields["consecutive"] == "1" and fields["round"] == "1"
+
+    stalled = _agent([SpyTool()], [])
+    stalled.llm = ScriptedLLM([
+        LLMResponse(content="", tool_calls=[_tc(call_id=f"c{i}")])
+        for i in range(2)
+    ])
+    stalled.max_rounds = 2
+    out2 = _capture()
+    assert "maximum tool-call rounds" in stalled.chat("hi")
+    assert _fields(_lines(out2, "max_rounds")[0])["rounds"] == "2"
+
+
+def test_context_events_are_logged():
+    out = _capture()
+    ctx = ContextManager(max_tokens=100)
+    messages = [{"role": "tool", "content": "\n".join(f"line {i}" for i in range(600))}]
+    ctx.maybe_compress(messages)
+
+    compressed = _lines(out, "context_compressed")
+    assert len(compressed) == 1
+    assert _fields(compressed[0])["layer"] == "snip"
+
+    class FailingLLM:
+        def chat(self, **kwargs):
+            raise RuntimeError("summary boom")
+
+    out2 = _capture()
+    ctx._get_summary([{"role": "user", "content": "hi"}], FailingLLM())
+    fallback = _lines(out2, "context_summary_fallback")
+    assert len(fallback) == 1
+    assert _fields(fallback[0])["error_type"] == "RuntimeError"
+
+
+def test_context_overflow_recovery_is_logged():
+    agent = _agent([SpyTool()], [])
+
+    class OverflowLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, tools=None, on_token=None, on_reasoning=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise _bad_request("maximum context length exceeded")
+            return LLMResponse(content="done")
+
+    agent.llm = OverflowLLM()
+    agent.messages = [{"role": "user", "content": "x" * 5000}] * 4
+    out = _capture()
+
+    assert agent.chat("more") == "done"
+    events = _lines(out, "context_overflow")
+    assert len(events) == 1
+    assert _fields(events[0])["error_type"] == "BadRequestError"
+
+
+# ─── 5. provider fallbacks and retries ─────────────────────────────────────
+
+def test_provider_param_fallbacks_are_logged():
+    out = _capture()
+    llm = LLM(model="gpt-5", api_key="sk-test", max_tokens=1024)
+    llm.client = mock.Mock()
+    llm.client.chat.completions.create.side_effect = [
+        _bad_request("Unsupported parameter: 'max_tokens' is not supported."),
+        [_chunk("ok")],
+    ]
+    assert llm.chat(messages=[{"role": "user", "content": "hi"}]).content == "ok"
+    fallback = _lines(out, "provider_fallback")
+    assert _fields(fallback[0])["kind"] == "max_completion_tokens"
+
+    out2 = _capture()
+    llm2 = LLM(model="gpt-5", api_key="sk-test", max_tokens=1024)
+    llm2.client = mock.Mock()
+    llm2.client.chat.completions.create.side_effect = [
+        _bad_request("Bad request"),
+        [_chunk("ok")],
+    ]
+    assert llm2.chat(messages=[{"role": "user", "content": "hi"}]).content == "ok"
+    fallback = _lines(out2, "provider_fallback")
+    assert _fields(fallback[0])["kind"] == "stream_options"
+
+
+def test_mid_stream_retry_is_logged(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    out = _capture()
+    llm = LLM(model="gpt-4o", api_key="sk-test")
+    llm.client = mock.Mock()
+    llm.client.chat.completions.create.side_effect = [
+        _DyingStream(_connection_error()),
+        [_chunk("full")],
+    ]
+
+    assert llm.chat(messages=[{"role": "user", "content": "hi"}]).content == "full"
+    retries = _lines(out, "llm_retry")
+    assert len(retries) == 1
+    assert _fields(retries[0])["stage"] == "stream"
+
+
+def test_litellm_retry_is_logged(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    out = _capture()
+    attempts = {"n": 0}
+
+    def completion(**params):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("rate_limit exceeded")
+        return "stream"
+
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
+    llm = LiteLLM(model="x")
+
+    assert llm._call_with_retry({"model": "x"}) == "stream"
+    retries = _lines(out, "llm_retry")
+    assert len(retries) == 1
+    assert _fields(retries[0])["stage"] == "create"
+
+
+# ─── 6. configure_audit behaviour ──────────────────────────────────────────
+
+def test_configure_audit_is_idempotent_and_falls_back_to_info():
+    stream = io.StringIO()
+    observability.configure_audit(stream=stream, level="LOUD")
+    observability.configure_audit(stream=stream)
+
+    handlers = [h for h in observability.audit_logger.handlers if getattr(h, "_cc_audit", False)]
+    assert len(handlers) == 1
+    assert handlers[0].level == logging.INFO
+
+
+def test_audit_stream_must_be_explicitly_opted_in(monkeypatch):
+    monkeypatch.delenv("CORECODER_AUDIT_FILE")
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", buf)
+    monkeypatch.setenv("CORECODER_AUDIT_STREAM", "stderr")
+
+    observability.configure_audit()
+    observability.log_event("probe")
+
+    assert "event=probe" in buf.getvalue()
+
+
+def test_default_file_name_is_per_process():
+    path = observability._default_audit_path()
+    assert path.name == f"audit.{os.getpid()}.log"
+    assert path.parent.name == ".corecoder"
+
+
+def test_unwritable_target_warns_once_and_never_raises(monkeypatch, tmp_path, caplog):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("CORECODER_AUDIT_FILE", str(blocker / "audit.log"))
+
+    with caplog.at_level(logging.WARNING, logger="corecoder"):
+        observability.configure_audit()
+
+    assert "event=audit_disabled" in caplog.text
+    observability.log_event("probe")  # no handler, no raise
+
+
+def test_oversized_log_rotates_at_startup(monkeypatch, tmp_path):
+    target = tmp_path / "audit.log"
+    target.write_text("x" * (1024 * 1024 + 10), encoding="utf-8")
+    monkeypatch.setenv("CORECODER_AUDIT_FILE", str(target))
+    monkeypatch.setenv("CORECODER_AUDIT_MAX_MB", "1")
+
+    observability.configure_audit()
+
+    assert (tmp_path / "audit.log.1").exists()
+    assert target.stat().st_size < 1024 * 1024
+
+
+def test_one_os_write_per_line(monkeypatch, tmp_path):
+    target = tmp_path / "audit.log"
+    observability.configure_audit(file=target)
+    with mock.patch("corecoder.observability.os.write", return_value=1) as write:
+        observability.log_event("probe", tool="spy")
+
+    assert write.call_count == 1
+    payload = write.call_args[0][1]
+    assert b"event=probe tool=spy" in payload and payload.endswith(b"\n")
+
+
+def test_default_logs_are_pruned_to_ten_but_explicit_paths_are_kept(monkeypatch, tmp_path):
+    target = tmp_path / f"audit.{os.getpid()}.log"
+    monkeypatch.setattr(observability, "_default_audit_path", lambda: target)
+    monkeypatch.delenv("CORECODER_AUDIT_FILE")
+    for i in range(12):
+        path = tmp_path / f"audit.{1000 + i}.log"
+        path.write_text("x", encoding="utf-8")
+        os.utime(path, (1000 + i, 1000 + i))
+
+    observability.configure_audit()
+
+    remaining = list(tmp_path.glob("audit.*.log"))
+    assert len(remaining) == 10
+    assert target in remaining
+
+    explicit_dir = tmp_path / "explicit"
+    explicit_dir.mkdir()
+    for i in range(12):
+        (explicit_dir / f"audit.{2000 + i}.log").write_text("x", encoding="utf-8")
+    observability.configure_audit(file=explicit_dir / "audit.other.log")
+    assert len(list(explicit_dir.glob("audit.*.log"))) == 13
+
+
+# ─── 7. degradation and privacy ────────────────────────────────────────────
+
+class _BrokenStream:
+    def __init__(self, fail_times=None):
+        self.writes = 0
+        self.fail_times = fail_times
+
+    def write(self, text):
+        self.writes += 1
+        if self.fail_times is None or self.writes <= self.fail_times:
+            raise OSError("disk full")
+
+    def flush(self):
+        pass
+
+
+def test_runtime_write_failures_warn_once_then_disable(caplog):
+    stream = _BrokenStream()
+    observability.configure_audit(stream=stream)
+
+    with caplog.at_level(logging.WARNING, logger="corecoder"):
+        for i in range(5):
+            observability.log_event(f"probe{i}")
+
+    warnings = [r for r in caplog.records if "audit_write_failed" in r.getMessage()]
+    assert len(warnings) == 1
+    assert stream.writes == 3  # the fourth call never reached the handler
+
+
+def test_a_successful_write_resets_the_failure_streak(caplog):
+    stream = _BrokenStream(fail_times=1)
+    observability.configure_audit(stream=stream)
+
+    with caplog.at_level(logging.WARNING, logger="corecoder"):
+        for i in range(5):
+            observability.log_event(f"probe{i}")
+
+    assert stream.writes == 5
+    assert len([r for r in caplog.records if "audit_write_failed" in r.getMessage()]) == 1
+
+
+def test_log_event_never_raises_even_when_the_formatter_does():
+    observability.configure_audit(stream=io.StringIO())
+
+    class Exploding(logging.Formatter):
+        def format(self, record):
+            raise RuntimeError("format boom")
+
+    for handler in observability.audit_logger.handlers:
+        handler.setFormatter(Exploding())
+
+    observability.log_event("probe")
+
+
+def test_a_crashing_audit_backend_does_not_replace_keyboardinterrupt():
+    observability.configure_audit(stream=io.StringIO())
+
+    class Exploding(logging.Formatter):
+        def format(self, record):
+            raise RuntimeError("format boom")
+
+    for handler in observability.audit_logger.handlers:
+        handler.setFormatter(Exploding())
+
+    class Killer(SpyTool):
+        def execute(self):
+            raise KeyboardInterrupt
+
+    killer = Killer()
+    killer.name = "killer"
+    agent = _agent([killer], [_turn(_tc("killer", "c1"))])
+
+    with pytest.raises(KeyboardInterrupt):
+        agent.chat("go")
+    replied = {m["tool_call_id"] for m in agent.messages if m.get("role") == "tool"}
+    assert replied == {"c1"}
+
+
+def test_audit_never_records_prompts_arguments_or_results():
+    sentinel = "SENTINEL_SECRET_VALUE"
+    tool = SpyTool(result=f"output {sentinel}")
+    agent = _agent([tool], [
+        _turn(_tc()),
+        _turn(_tc(call_id="c2", raw="{broken", error=sentinel)),
+        _turn(content="done"),
+    ])
+    out = _capture()
+
+    agent.chat(f"please use {sentinel}")
+
+    assert sentinel not in out.getvalue()
+    assert "please use" not in out.getvalue()
+
+
+# ─── 8. CLI wiring ─────────────────────────────────────────────────────────
+
+def test_main_configures_logging(monkeypatch):
+    import corecoder.cli as cli
+    from corecoder import demo
+
+    calls = []
+    monkeypatch.setattr(cli, "configure_logging", lambda: calls.append(1))
+    monkeypatch.setattr(sys, "argv", ["corecoder", "--demo"])
+    monkeypatch.setattr(demo, "run_demo", lambda: 0)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert calls

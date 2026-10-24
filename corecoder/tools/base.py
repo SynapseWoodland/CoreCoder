@@ -8,6 +8,14 @@ from abc import ABC, abstractmethod
 FILE_MUTATION_LOCK = threading.Lock()
 
 
+class ToolRefused(str):
+    """A tool result that is a refusal rather than an execution outcome.
+
+    It stays a ``str`` so every existing consumer (history, hooks, tests) sees
+    plain text, while the audit layer can tell "the tool said no" apart from
+    "the tool ran and returned a warning"."""
+
+
 class Tool(ABC):
     """Minimal tool interface. Subclass this to add new capabilities."""
 

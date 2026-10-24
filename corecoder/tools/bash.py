@@ -14,7 +14,7 @@ import threading
 from typing import ClassVar
 
 from ..shell import run_shell
-from .base import Tool
+from .base import Tool, ToolRefused
 
 # Track cwd across commands (Claude Code does this too). Thread-local, so that
 # when the agent executes tools in parallel two bash calls never race on one
@@ -78,7 +78,10 @@ class BashTool(Tool):
         # safety check
         warning = _check_dangerous(command)
         if warning:
-            return f"⚠ Blocked: {warning}\nCommand: {command}\nIf intentional, modify the command to be more specific."
+            return ToolRefused(
+                f"⚠ Blocked: {warning}\nCommand: {command}\n"
+                "If intentional, modify the command to be more specific."
+            )
 
         # use this thread's own tracked working directory
         cwd = get_tracked_cwd() or os.getcwd()

@@ -17,6 +17,7 @@ from .config import Config
 from .hooks import load_hooks
 from .llm import LLM, LiteLLM
 from .mcp import load_mcp_tools
+from .observability import configure_logging
 from .permissions import DEFAULT_STORE, Permission
 from .session import list_sessions, load_session, save_session
 from .tools import ALL_TOOLS
@@ -42,6 +43,7 @@ def _parse_args():
 
 
 def main():
+    configure_logging()
     args = _parse_args()
 
     if args.demo:
@@ -49,6 +51,8 @@ def main():
         raise SystemExit(run_demo())
 
     config = Config.from_env()
+    # .env is loaded above, so re-read CORECODER_LOG_* now that it is available
+    configure_logging()
 
     # CLI args override env vars
     if args.model:

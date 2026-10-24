@@ -12,15 +12,18 @@ which means it's done working and ready to report back.
 import concurrent.futures
 import inspect
 import json
+import logging
 import re
+import time
 
 from .context import ContextManager, estimate_tokens
 from .llm import LLM, is_context_length_error
+from .observability import log_event
 from .permissions import Permission
 from .prompt import PLAN_MODE_PROMPT, system_prompt
 from .tools import ALL_TOOLS
 from .tools.agent import AgentTool
-from .tools.base import Tool
+from .tools.base import Tool, ToolRefused
 from .tools.todo import TodoWriteTool
 
 
@@ -91,7 +94,8 @@ class Agent:
             self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
 
         truncated_rounds = 0  # M2 guard: consecutive truncation counter
-        for _ in range(self.max_rounds):
+        for round_idx in range(self.max_rounds):
+            current_round = round_idx + 1
             try:
                 resp = self.llm.chat(
                     messages=self._full_messages(),
@@ -105,7 +109,18 @@ class Agent:
                 # re-issue. A too-short history cannot free enough to help.
                 if not is_context_length_error(e) or len(self.messages) <= 4:
                     raise
+                before_messages = len(self.messages)
+                before_tokens = estimate_tokens(self.messages) + self._fixed_prompt_tokens()
                 self.context.force_collapse(self.messages, self.llm)
+                log_event(
+                    "context_overflow",
+                    messages_before=before_messages,
+                    messages_after=len(self.messages),
+                    estimated_before=before_tokens,
+                    estimated_after=(
+                        estimate_tokens(self.messages) + self._fixed_prompt_tokens()),
+                    error_type=type(e).__name__,
+                )
                 resp = self.llm.chat(
                     messages=self._full_messages(),
                     tools=self._tool_schemas(),
@@ -116,6 +131,12 @@ class Agent:
             # M2: truncated response with tool_calls -> do NOT execute anything
             if resp.finish_reason == "length" and resp.tool_calls:
                 truncated_rounds += 1
+                log_event(
+                    "output_truncated",
+                    consecutive=truncated_rounds,
+                    tool_calls=len(resp.tool_calls),
+                    round=current_round,
+                )
                 self._answer_truncated_tool_calls(resp)
                 if truncated_rounds >= 2:
                     # the history is already valid, so a retry or /save still works
@@ -138,7 +159,7 @@ class Agent:
             self.messages.append(resp.message)
 
             try:
-                self._execute_round(resp, on_tool)
+                self._execute_round(resp, on_tool, round_idx=current_round)
             finally:
                 # any escape from the round (Ctrl+C, a crashing on_tool or ask
                 # callback, a BaseException from a tool) would leave the
@@ -159,6 +180,7 @@ class Agent:
                 "model output truncated; raise max_tokens "
                 "(CORECODER_MAX_TOKENS) or reduce the request"
             )
+        log_event("max_rounds", level=logging.WARNING, rounds=self.max_rounds)
         return "(reached maximum tool-call rounds)"
 
     def _answer_truncated_tool_calls(self, resp) -> None:
@@ -175,7 +197,7 @@ class Agent:
                 ),
             })
 
-    def _execute_round(self, resp, on_tool=None) -> None:
+    def _execute_round(self, resp, on_tool=None, round_idx=None) -> None:
         """Execute one tool-call round: single calls inline, multiple calls in
         parallel, appending one tool reply per call to the history."""
         if len(resp.tool_calls) == 1:
@@ -184,12 +206,18 @@ class Agent:
                 on_tool(tc.name, tc.arguments)
             # a call with broken arguments is rejected before hooks and
             # consent: no side effect, and nobody is asked to approve junk
-            result = (self._bad_arguments(tc)
-                      or self._pre_hooks(tc)
-                      or self._permit(tc))
+            start = time.perf_counter()
+            result, decision = self._decide(tc)
+            decision_ms = int((time.perf_counter() - start) * 1000)
+            self._log_decision(tc, decision, decision_ms, round_idx)
+            meta: dict = {"decision_ms": decision_ms}
             if result is None:
-                result = self._exec_tool(tc)
+                result = self._exec_tool(tc, meta)
                 self._post_hooks(tc, result)
+            else:
+                meta.update(chars_in=len(result), chars_out=len(result),
+                            error_text=result.startswith("Error:"))
+            self._log_result(tc, decision, meta, round_idx)
             self.messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -197,13 +225,58 @@ class Agent:
             })
         else:
             # parallel execution for multiple tool calls
-            results = self._exec_tools_parallel(resp.tool_calls, on_tool)
+            results = self._exec_tools_parallel(resp.tool_calls, on_tool, round_idx)
             for tc, result in zip(resp.tool_calls, results):
                 self.messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": result,
                 })
+
+    @staticmethod
+    def _round_fields(round_idx) -> dict:
+        # an omitted round means "the caller did not know", not round zero
+        return {} if round_idx is None else {"round": round_idx}
+
+    @staticmethod
+    def _args_chars(tc) -> int:
+        raw = getattr(tc, "raw_arguments", "") or ""
+        if raw:
+            return len(raw)
+        arguments = getattr(tc, "arguments", None) or {}
+        if not arguments:
+            return 0
+        try:
+            return len(json.dumps(arguments, ensure_ascii=False))
+        except (TypeError, ValueError):
+            return 0
+
+    def _log_decision(self, tc, decision: str, decision_ms: int, round_idx=None) -> None:
+        log_event(
+            "tool_decision", **self._round_fields(round_idx), tool=tc.name,
+            call_id=tc.id, decision=decision, args_chars=self._args_chars(tc),
+            decision_ms=decision_ms,
+        )
+
+    def _log_result(self, tc, decision: str, meta: dict, round_idx=None) -> None:
+        refused = decision == "execute" and meta.get("refused", False)
+        effective = "tool_refused" if refused else decision
+        if effective == "execute":
+            outcome = "error" if meta.get("error_type") else "ok"
+        else:
+            outcome = "skipped"
+        log_event(
+            "tool_result", **self._round_fields(round_idx), tool=tc.name,
+            call_id=tc.id, effective_decision=effective, outcome=outcome,
+            error_text=bool(meta.get("error_text", False)),
+            duration_ms=meta.get("duration_ms", 0),
+            decision_ms=meta.get("decision_ms", 0),
+            chars_in=meta.get("chars_in", 0),
+            chars_out=meta.get("chars_out", 0),
+            truncated=bool(meta.get("truncated", False)),
+            redacted=bool(meta.get("redacted", False)),
+            error_type=meta.get("error_type", ""),
+        )
 
     @staticmethod
     def _bad_arguments(tc) -> str | None:
@@ -238,7 +311,10 @@ class Agent:
     def _permit(self, tc) -> str | None:
         """Consent check for one call. None means go ahead; a string is the
         refusal, returned as the tool result instead of executing."""
-        # plan mode outranks consent, even --yes: while it's on nothing mutates
+        return self._plan_mode_block(tc) or self._check_permission(tc)
+
+    def _plan_mode_block(self, tc) -> str | None:
+        """Plan mode outranks consent, even --yes: while it's on nothing mutates."""
         if self.plan_mode and tc.name not in Permission.READ_ONLY:
             return (
                 "Plan mode is on, so this call was refused: plan mode is "
@@ -246,51 +322,95 @@ class Agent:
                 "read-only tools, then present the plan and stop. The user can "
                 'approve it by typing "approve", or exit plan mode with /plan.'
             )
+        return None
+
+    def _check_permission(self, tc) -> str | None:
         if self.permission is None:
             return None
         return self.permission.check(tc.name, tc.arguments)
 
-    def _exec_tool(self, tc) -> str:
-        """Execute one tool call and govern its result before it hits history."""
-        return self._govern_result(self._exec_tool_raw(tc))
+    def _decide(self, tc) -> tuple[str | None, str]:
+        """Settle one call before execution: the refusal text (or None) and
+        the reason. Broken arguments short-circuit hooks and consent."""
+        result = self._bad_arguments(tc)
+        if result is not None:
+            return result, "bad_arguments"
+        result = self._pre_hooks(tc)
+        if result is not None:
+            return result, "pre_hook"
+        result = self._plan_mode_block(tc)
+        if result is not None:
+            return result, "plan_mode"
+        result = self._check_permission(tc)
+        if result is not None:
+            return result, "denied"
+        return None, "execute"
 
-    def _govern_result(self, result: str) -> str:
+    def _exec_tool(self, tc, meta: dict | None = None) -> str:
+        """Execute one tool call and govern its result before it hits history."""
+        meta = {} if meta is None else meta
+        start = time.perf_counter()
+        try:
+            raw = self._exec_tool_raw(tc, meta)
+        finally:
+            # sub-millisecond tools must not collapse to a misleading zero
+            meta["duration_ms"] = round((time.perf_counter() - start) * 1000, 3)
+        return self._govern_result(raw, meta)
+
+    def _govern_result(self, result: str, meta: dict | None = None) -> str:
         """Clamp and redact a tool result: the single exit for every path."""
+        meta = {} if meta is None else meta
         limit = self.max_tool_result_chars
-        if len(result) > limit:
+        chars_in = len(result)
+        truncated = chars_in > limit
+        meta["chars_in"] = chars_in
+        if truncated:
             head = limit * 2 // 3
             tail = limit - head
             result = (
                 result[:head]
-                + f"\n... (truncated: {len(result)} chars total, "
+                + f"\n... (truncated: {chars_in} chars total, "
                   f"showing first {head} and last {tail}) ...\n"
                 + result[-tail:]
             )
-        return _redact(result)
+        text = _redact(result)
+        meta["truncated"] = truncated
+        meta["redacted"] = text != result
+        meta["chars_out"] = len(text)
+        meta["error_text"] = text.startswith("Error:")
+        return text
 
-    def _exec_tool_raw(self, tc) -> str:
+    def _exec_tool_raw(self, tc, meta: dict | None = None) -> str:
         """Execute a single tool call, returning the raw result string."""
+        meta = {} if meta is None else meta
         tool = self._tool_by_name.get(tc.name)
         if tool is None:
+            meta["error_type"] = "unknown_tool"
             return f"Error: unknown tool '{tc.name}'"
         # second line of defence: every execution path lands here, including
         # parallel workers, so broken arguments can never reach a tool
         bad = self._bad_arguments(tc)
         if bad is not None:
+            meta["error_type"] = "bad_arguments"
             return bad
         # validate arguments first so a TypeError raised *inside* the tool isn't
         # mislabelled as a bad-arguments error from the caller
         try:
             inspect.signature(tool.execute).bind(**tc.arguments)
         except TypeError as e:
+            meta["error_type"] = "TypeError"
             return f"Error: bad arguments for {tc.name}: {e}"
         # a tool that blows up gets reported back as text, never kills the loop
         try:
-            return tool.execute(**tc.arguments)
+            out = tool.execute(**tc.arguments)
         except Exception as e:  # noqa: BLE001
+            meta["error_type"] = type(e).__name__
             return f"Error executing {tc.name}: {e}"
+        if isinstance(out, ToolRefused):
+            meta["refused"] = True
+        return out
 
-    def _exec_tools_parallel(self, tool_calls, on_tool=None) -> list[str]:
+    def _exec_tools_parallel(self, tool_calls, on_tool=None, round_idx=None) -> list[str]:
         """Run multiple tool calls concurrently using threads.
 
         This is inspired by Claude Code's StreamingToolExecutor which starts
@@ -306,19 +426,39 @@ class Agent:
         # hooks and consent are settled up front on this thread: prompting
         # from pool workers would interleave several prompts on one terminal.
         # broken arguments short-circuit both: they are refused, not approved
-        results = [self._bad_arguments(tc)
-                   or self._pre_hooks(tc)
-                   or self._permit(tc) for tc in tool_calls]
+        settled: list[tuple[str | None, str, int]] = []
+        results: list[str | None] = []
+        for tc in tool_calls:
+            start = time.perf_counter()
+            result, decision = self._decide(tc)
+            decision_ms = int((time.perf_counter() - start) * 1000)
+            self._log_decision(tc, decision, decision_ms, round_idx)
+            settled.append((result, decision, decision_ms))
+            results.append(result)
+
+        for i, tc in enumerate(tool_calls):
+            result, decision, decision_ms = settled[i]
+            if result is not None:
+                meta = {"decision_ms": decision_ms, "chars_in": len(result),
+                        "chars_out": len(result),
+                        "error_text": result.startswith("Error:")}
+                self._log_result(tc, decision, meta, round_idx)
+
         # the tracked cwd is thread-local, so pool workers would otherwise
         # start from the launch directory: hand the session cwd in, and merge
         # any cd back in call order so the batch behaves like a sequence
         session_cwd = get_tracked_cwd()
+        metas = {
+            i: {"decision_ms": settled[i][2]}
+            for i, tc in enumerate(tool_calls)
+            if settled[i][0] is None
+        }
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             def run(i, tc, base_cwd):
                 is_bash = tc.name == "bash"
                 if is_bash and base_cwd is not None:
                     set_tracked_cwd(base_cwd)
-                out = self._exec_tool(tc)
+                out = self._exec_tool(tc, metas[i])
                 if not is_bash:
                     return i, out, None
                 cwd_after = get_tracked_cwd()
@@ -329,10 +469,11 @@ class Agent:
             futures = {
                 i: pool.submit(run, i, tc, session_cwd)
                 for i, tc in enumerate(tool_calls)
-                if results[i] is None
+                if i in metas
             }
             for i, future in futures.items():
                 i, results[i], worker_cwd = future.result()
+                self._log_result(tool_calls[i], "execute", metas[i], round_idx)
                 if worker_cwd is not None:
                     session_cwd = worker_cwd
                     set_tracked_cwd(worker_cwd)
@@ -348,13 +489,15 @@ class Agent:
         history valid when execution is interrupted partway through.
         """
         answered = {m.get("tool_call_id") for m in self.messages if m.get("role") == "tool"}
-        for tc in tool_calls:
-            if tc.id not in answered:
-                self.messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": "[interrupted]",
-                })
+        pending = [tc for tc in tool_calls if tc.id not in answered]
+        for tc in pending:
+            self.messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": "[interrupted]",
+            })
+        if pending:
+            log_event("backfill", count=len(pending))
 
     def reset(self):
         """Clear conversation history."""

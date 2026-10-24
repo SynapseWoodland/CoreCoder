@@ -18,6 +18,8 @@ import math
 import re
 from typing import TYPE_CHECKING
 
+from .observability import log_event
+
 if TYPE_CHECKING:
     from .llm import LLM
 
@@ -67,23 +69,33 @@ class ContextManager:
         # Layer 1: snip verbose tool outputs
         if current > self._snip_at and self._snip_tool_outputs(messages):
             compressed = True
-            current = estimate_tokens(messages) + fixed_tokens
+            after = estimate_tokens(messages) + fixed_tokens
+            log_event("context_compressed", layer="snip", fixed_tokens=fixed_tokens,
+                      before=current, after=after)
+            current = after
 
         # Layer 2: LLM-powered summarization of old turns
         if current > self._summarize_at and len(messages) > 10 and self._summarize_old(messages, llm, keep_recent=8):
             compressed = True
-            current = estimate_tokens(messages) + fixed_tokens
+            after = estimate_tokens(messages) + fixed_tokens
+            log_event("context_compressed", layer="summarize", fixed_tokens=fixed_tokens,
+                      before=current, after=after)
+            current = after
 
         # Layer 3: hard collapse - last resort
         if current > self._collapse_at and len(messages) > 4:
             self._hard_collapse(messages, llm)
             compressed = True
+            log_event("context_compressed", layer="collapse", fixed_tokens=fixed_tokens,
+                      before=current, after=estimate_tokens(messages) + fixed_tokens)
 
         return compressed
 
     def force_collapse(self, messages: list[dict], llm: LLM | None = None) -> None:
         """Last-resort compaction after the provider rejects a request."""
+        before = estimate_tokens(messages)
         self._hard_collapse(messages, llm)
+        log_event("context_forced", before=before, after=estimate_tokens(messages))
 
     @staticmethod
     def _snip_tool_outputs(messages: list[dict]) -> bool:
@@ -188,9 +200,9 @@ class ContextManager:
                     ],
                 )
                 return resp.content
-            except Exception:  # noqa: BLE001, S110
+            except Exception as e:  # noqa: BLE001
                 # summarization is best-effort; fall back to extraction below
-                pass
+                log_event("context_summary_fallback", error_type=type(e).__name__)
 
         # fallback: extract key lines
         return self._extract_key_info(messages)
