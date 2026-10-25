@@ -3,7 +3,9 @@
 Tracing is off by default and never changes agent behaviour: every backend is
 wrapped by :class:`SafeTracer`, which turns a broken sink into a one-time
 warning. Audit logging is separate (see ``observability.py``): audit is
-metadata-only and cheap, tracing is a span tree meant for a viewer.
+metadata-only and cheap, tracing is a span tree meant for a viewer. The two
+meet through ``current_trace_context``: audit lines carry the ids of the span
+that was open, so a line and its trace record can be joined.
 """
 
 import atexit
@@ -18,6 +20,44 @@ from pathlib import Path
 from .observability import prune_old_logs
 
 _general = logging.getLogger("corecoder")
+
+
+# The spans open on this thread, across every tracer instance. The audit log
+# asks for the innermost one so a line can name the span it belongs to; that is
+# the only link between the two streams, and it lives here because the tracers
+# own the span ids. Per-thread, like the tracers' own stacks: a parallel worker
+# starts no span, so it reports none.
+_context = threading.local()
+
+
+def _push_context(span) -> None:
+    stack = getattr(_context, "stack", None)
+    if stack is None:
+        stack = _context.stack = []
+    stack.append(span)
+
+
+def _pop_context(span) -> None:
+    stack = getattr(_context, "stack", None)
+    if not stack:
+        return
+    if stack[-1] is span:
+        stack.pop()
+    elif span in stack:
+        stack.remove(span)
+
+
+def current_trace_context() -> dict[str, str] | None:
+    """Ids of the innermost span open on this thread, as audit join keys.
+
+    ``None`` when tracing is off: a NullTracer produces no spans, so there is
+    nothing to join, and invented ids would make a broken join look fine.
+    """
+    stack = getattr(_context, "stack", None)
+    if not stack:
+        return None
+    span = stack[-1]
+    return {"trace_id": span.trace_id, "span_id": span.span_id}
 
 
 class TracingUnavailable(RuntimeError):
@@ -90,6 +130,7 @@ class _BaseSpan(Span):
         self.start = time.time()
         self.end_time: float | None = None
         self._ended = False
+        _push_context(self)
 
     def update(self, **attrs) -> None:
         self.attrs.update(self.tracer._filter(attrs))
@@ -123,6 +164,7 @@ class _BaseSpan(Span):
             self._close()
         finally:
             self.tracer._pop(self)
+            _pop_context(self)
 
     def _close(self) -> None:
         raise NotImplementedError

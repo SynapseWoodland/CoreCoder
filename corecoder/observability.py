@@ -9,6 +9,10 @@ counts. Arguments, results and user input never enter the log. ``log_event``
 never raises: it runs from ``finally`` blocks where an exception would replace
 the real failure (a swallowed KeyboardInterrupt, for example).
 
+When tracing is on, each line also carries the ``trace_id``/``span_id`` of the
+span that was open, so the audit log and the span tree describe the same work
+and can be joined; tracing off simply omits the fields.
+
 Sinks (first match wins):
 
 - an explicit ``stream=`` passed by an embedding or a test,
@@ -192,6 +196,19 @@ def _format(event: str, fields: dict) -> str:
     return " ".join(parts)
 
 
+def _trace_context() -> dict:
+    """Ids of the span open on this thread, or nothing when tracing is off.
+
+    Imported lazily: ``tracing`` imports this module, so a top-level import
+    here would be a cycle. Failing to resolve the ids must never cost the line.
+    """
+    try:
+        from .tracing import current_trace_context
+        return current_trace_context() or {}
+    except Exception:  # noqa: BLE001, S110 - the line matters more than the join
+        return {}
+
+
 def _write_failed(exc: BaseException) -> None:
     _state.failures += 1
     if not _state.warned:
@@ -206,7 +223,11 @@ def _write_failed(exc: BaseException) -> None:
 
 def log_event(event: str, level: int = logging.INFO, **fields) -> None:
     """Append one structured line. Never raises, never touches the terminal
-    on its own, and drops silently once audit is switched off."""
+    on its own, and drops silently once audit is switched off.
+
+    With tracing on, the line also names the span that was open (``trace_id``,
+    ``span_id``); that is what lets a reader find the matching trace record.
+    """
     try:
         if not audit_enabled() or _state.disabled:
             return
@@ -218,6 +239,11 @@ def log_event(event: str, level: int = logging.INFO, **fields) -> None:
                 return
         if level < handler.level:
             return
+        # same names as the trace record, so the two files join on them; a
+        # caller may set them explicitly and win over the ambient span
+        context = _trace_context()
+        if context:
+            fields = {**context, **fields}
         record = logging.LogRecord(
             "corecoder.audit", level, __file__, 0, _format(event, fields), None, None)
         try:

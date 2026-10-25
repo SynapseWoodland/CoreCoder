@@ -385,21 +385,29 @@ class Agent:
                 **self._round_fields(round_idx),
                 args_chars=self._args_chars(tc),
             )
-            start = time.perf_counter()
-            result, decision = self._decide(tc)
-            decision_ms = int((time.perf_counter() - start) * 1000)
-            self._log_decision(tc, decision, decision_ms, round_idx)
-            meta: dict = {"decision_ms": decision_ms}
-            if result is None:
-                result = self._exec_tool(tc, meta)
-                self._post_hooks(tc, result)
-                if stats is not None and not meta.get("refused"):
-                    stats["executed"] += 1
-            else:
-                meta.update(chars_in=len(result), chars_out=len(result),
-                            error_text=result.startswith("Error:"))
-            self._log_result(tc, decision, meta, round_idx, result=result,
-                             span=tool_span)
+            try:
+                start = time.perf_counter()
+                result, decision = self._decide(tc)
+                decision_ms = int((time.perf_counter() - start) * 1000)
+                self._log_decision(tc, decision, decision_ms, round_idx)
+                meta: dict = {"decision_ms": decision_ms}
+                if result is None:
+                    result = self._exec_tool(tc, meta)
+                    self._post_hooks(tc, result)
+                    if stats is not None and not meta.get("refused"):
+                        stats["executed"] += 1
+                else:
+                    meta.update(chars_in=len(result), chars_out=len(result),
+                                error_text=result.startswith("Error:"))
+                self._log_result(tc, decision, meta, round_idx, result=result,
+                                 span=tool_span)
+            except BaseException as e:
+                # an escape (Ctrl+C, a BaseException from a tool or a hook) skips
+                # _log_result, which is what normally ends the span. Left open it
+                # would lose the call from the trace and keep naming it in every
+                # later audit line, so close it here; end() is idempotent.
+                tool_span.end(error=f"{type(e).__name__}: {e}")
+                raise
             self.messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -461,10 +469,6 @@ class Agent:
             "redacted": bool(meta.get("redacted", False)),
             "error_type": meta.get("error_type", ""),
         }
-        log_event(
-            "tool_result", **self._round_fields(round_idx), tool=tc.name,
-            call_id=tc.id, **fields,
-        )
         if span is None:
             span = self.tracer.start(
                 f"tool.{tc.name}", as_type="tool",
@@ -481,6 +485,12 @@ class Agent:
             if started_at is None:
                 started_at = time.time() - duration
             span.retime(started_at, started_at + duration)
+        # logged while the span is open: the audit line then carries the same
+        # trace_id/span_id as the trace record describing this call
+        log_event(
+            "tool_result", **self._round_fields(round_idx), tool=tc.name,
+            call_id=tc.id, **fields,
+        )
         trace_fields = dict(fields, decision=decision, tool=tc.name, call_id=tc.id)
         if decision == "bad_arguments":
             self._trace_withheld.add(tc.id)

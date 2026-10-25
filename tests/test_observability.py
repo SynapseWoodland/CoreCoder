@@ -7,6 +7,7 @@ result or user input is recorded.
 """
 
 import io
+import json
 import logging
 import os
 import sys
@@ -28,6 +29,7 @@ from corecoder.permissions import Permission
 from corecoder.session import load_session, load_session_record, save_session
 from corecoder.tools.base import Tool, ToolRefused
 from corecoder.tools.bash import BashTool
+from corecoder.tracing import JsonlTracer, NullTracer
 
 
 @pytest.fixture(autouse=True)
@@ -849,3 +851,105 @@ def test_main_configures_logging(monkeypatch):
 
     assert exc.value.code == 0
     assert calls
+
+
+# ─── 10. joining the audit log with the trace ──────────────────────────────
+
+def _trace_records(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def test_audit_lines_name_the_span_that_was_open(tmp_path):
+    """One run writes two files. Every audit line must say which span it
+    belongs to, or the same work is described twice without ever meeting."""
+    trace_path = tmp_path / "trace.jsonl"
+    out = _capture()
+    agent = _agent([SpyTool()], [_turn(_tc(call_id="c1")), _turn(content="done")],
+                   tracer=JsonlTracer(trace_path))
+
+    agent.chat("hi")
+
+    records = _trace_records(trace_path)
+    trace_ids = {r["trace_id"] for r in records}
+    by_span = {r["span_id"]: r for r in records}
+    lines = _lines(out)
+    assert lines
+    for line in lines:
+        fields = _fields(line)
+        assert fields["trace_id"] in trace_ids
+        assert fields["span_id"] in by_span
+
+    assert by_span[_fields(_lines(out, "run_summary")[0])["span_id"]]["name"] == "agent.chat"
+    assert by_span[_fields(_lines(out, "llm_call")[0])["span_id"]]["name"] == "llm.round"
+
+    result = _fields(_lines(out, "tool_result")[0])
+    tool_span = by_span[result["span_id"]]
+    assert tool_span["name"] == "tool.spy"
+    assert tool_span["attrs"]["call_id"] == result["call_id"] == "c1"
+
+
+def test_parallel_audit_lines_map_to_their_own_spans(tmp_path):
+    """A parallel worker cannot open its span on the tracer's thread-local
+    stack, so the span is created late; the audit line written for it must
+    still name that span, not the root."""
+    trace_path = tmp_path / "trace.jsonl"
+    out = _capture()
+    llm = ScriptedLLM([
+        _turn(_tc("spy", "ok"),
+              _tc("spy", "bad", raw="{broken", error="expecting ','")),
+        _turn(content="done"),
+    ])
+    agent = Agent(llm=llm, tools=[SpyTool()], tracer=JsonlTracer(trace_path))
+
+    agent.chat("go")
+
+    by_span = {r["span_id"]: r for r in _trace_records(trace_path) if r["type"] == "tool"}
+    results = {_fields(line)["call_id"]: _fields(line) for line in _lines(out, "tool_result")}
+    assert set(results) == {"ok", "bad"}
+    assert {results[c]["outcome"] for c in results} == {"ok", "skipped"}
+    assert results["ok"]["span_id"] != results["bad"]["span_id"]
+    for call_id, fields in results.items():
+        span = by_span[fields["span_id"]]
+        assert span["attrs"]["call_id"] == call_id
+        assert span["trace_id"] == fields["trace_id"]
+
+
+def test_audit_lines_carry_no_ids_when_tracing_is_off():
+    """Tracing off means there is no span to name. Inventing ids would make a
+    broken join look successful, so the fields are simply absent."""
+    out = _capture()
+
+    Agent(llm=ScriptedLLM([LLMResponse(content="done")]), tools=[],
+          tracer=NullTracer()).chat("hi")
+
+    summary = _fields(_lines(out, "run_summary")[0])
+    assert "trace_id" not in summary
+    assert "span_id" not in summary
+
+
+def test_interrupted_tool_call_closes_its_span(tmp_path):
+    """A call that never returns skips _log_result, which is what ends the
+    span. Left open, the trace loses the call and every later audit line keeps
+    naming a span that is already dead."""
+    trace_path = tmp_path / "trace.jsonl"
+    tracer = JsonlTracer(trace_path)
+
+    class Killer(SpyTool):
+        def execute(self):
+            raise KeyboardInterrupt
+
+    killer = Killer()
+    killer.name = "killer"
+    agent = Agent(llm=ScriptedLLM([_turn(_tc("killer", "c1"))]), tools=[killer],
+                  tracer=tracer)
+    with pytest.raises(KeyboardInterrupt):
+        agent.chat("go")
+
+    record = next(r for r in _trace_records(trace_path) if r["name"] == "tool.killer")
+    assert "KeyboardInterrupt" in record["error"]
+
+    out = _capture()
+    Agent(llm=ScriptedLLM([LLMResponse(content="done")]), tools=[],
+          tracer=tracer).chat("hi")
+    assert _fields(_lines(out, "run_summary")[0])["span_id"] != record["span_id"]
