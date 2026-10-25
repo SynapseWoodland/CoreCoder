@@ -322,6 +322,35 @@ def test_parallel_tools_get_spans_and_positive_durations(tmp_path):
     assert sorted(call_ids) == sorted(replies)
 
 
+def test_parallel_tool_span_duration_matches_measured(tmp_path):
+    """A parallel worker runs off the tracer's thread-local stack, so its span
+    is opened after the call is already over. The record must replay the
+    measured interval, not the instant the span object was created."""
+    path = tmp_path / "trace.jsonl"
+    tracer = JsonlTracer(path)
+    tool = SpyTool(delay=0.02)
+    llm = scripted(
+        LLMResponse(content="", tool_calls=[
+            ToolCall(id="a", name="spy", arguments={"text": "a"}),
+            ToolCall(id="b", name="spy", arguments={"text": "b"}),
+            ToolCall(id="c", name="spy", arguments={"text": "c"}),
+        ]),
+        LLMResponse(content="done"),
+    )
+    agent = make_agent(tracer, tool=tool, llm=llm)
+
+    assert agent.chat("go") == "done"
+
+    tools = [r for r in rows(path) if r["type"] == "tool"]
+    assert len(tools) == 3
+    for record in tools:
+        assert record["duration_ms"] > 0
+        assert record["duration_ms"] == record["attrs"]["duration_ms"]
+        # the replayed interval is what these two timestamps span
+        assert record["end"] - record["start"] == pytest.approx(
+            record["duration_ms"] / 1000, abs=1e-5)
+
+
 # ─── 8. rotation ───────────────────────────────────────────────────────────
 
 def test_jsonl_rotates_when_file_exceeds_max_bytes(tmp_path):

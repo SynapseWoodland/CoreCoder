@@ -31,6 +31,10 @@ class Span:
     def event(self, name: str, **fields) -> None:
         raise NotImplementedError
 
+    def retime(self, start: float, end: float) -> None:
+        """Place this span on the timeline after the fact."""
+        raise NotImplementedError
+
     def end(self, **attrs) -> None:
         raise NotImplementedError
 
@@ -50,6 +54,9 @@ class NullSpan(Span):
         pass
 
     def event(self, name: str, **fields) -> None:
+        pass
+
+    def retime(self, start: float, end: float) -> None:
         pass
 
     def end(self, **attrs) -> None:
@@ -91,6 +98,17 @@ class _BaseSpan(Span):
         self.events.append({"name": name, "t": time.time(),
                             **self.tracer._filter(fields)})
 
+    def retime(self, start: float, end: float) -> None:
+        """Replay a measured interval for a span opened once its work was over.
+
+        A span created after the fact would otherwise start and end in the same
+        instant and report duration_ms=0. Backends that time themselves (the
+        Langfuse SDK) are unaffected; their metadata still carries the measured
+        duration_ms.
+        """
+        self.start = start
+        self.end_time = end
+
     def end(self, **attrs) -> None:
         if self._ended:
             return
@@ -99,7 +117,8 @@ class _BaseSpan(Span):
         if error is not None:
             self.error = str(error)
         self.attrs.update(self.tracer._filter(attrs))
-        self.end_time = time.time()
+        if self.end_time is None:
+            self.end_time = time.time()
         try:
             self._close()
         finally:
@@ -300,6 +319,9 @@ class SafeSpan(Span):
 
     def event(self, name: str, **fields) -> None:
         self._call("event", name, **fields)
+
+    def retime(self, start: float, end: float) -> None:
+        self._call("retime", start, end)
 
     def end(self, **attrs) -> None:
         self._call("end", **attrs)

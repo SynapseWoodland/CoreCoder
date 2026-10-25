@@ -471,6 +471,16 @@ class Agent:
                 **self._round_fields(round_idx),
                 args_chars=self._args_chars(tc),
             )
+            # A parallel worker cannot use the tracer's thread-local span stack,
+            # so its span is only opened here, after the call has finished, and
+            # would otherwise open and close in one instant (duration_ms=0).
+            # Replay the interval the worker measured, anchored at the moment
+            # execution actually began, so the record matches meta['duration_ms'].
+            duration = fields["duration_ms"] / 1000
+            started_at = meta.get("started_at")
+            if started_at is None:
+                started_at = time.time() - duration
+            span.retime(started_at, started_at + duration)
         trace_fields = dict(fields, decision=decision, tool=tc.name, call_id=tc.id)
         if decision == "bad_arguments":
             self._trace_withheld.add(tc.id)
@@ -564,11 +574,14 @@ class Agent:
         """Execute one tool call and govern its result before it hits history."""
         meta = {} if meta is None else meta
         start = time.perf_counter()
+        started_at = time.time()
         try:
             raw = self._exec_tool_raw(tc, meta)
         finally:
             # sub-millisecond tools must not collapse to a misleading zero
             meta["duration_ms"] = round((time.perf_counter() - start) * 1000, 3)
+            # wall-clock anchor for a span opened later, on the caller's thread
+            meta["started_at"] = started_at
         return self._govern_result(raw, meta)
 
     def _govern_result(self, result: str, meta: dict | None = None) -> str:
