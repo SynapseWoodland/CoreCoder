@@ -177,6 +177,26 @@ def _run_once(agent: Agent, prompt: str):
 
 def _repl(agent: Agent, config: Config):
     """Interactive read-eval-print loop."""
+    _print_banner(agent, config)
+    history = FileHistory(os.path.expanduser("~/.corecoder_history"))
+    kb = _key_bindings()
+
+    while True:
+        user_input = _read_prompt(agent, history, kb)
+        if user_input is None:
+            console.print("\nBye!")
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in ("quit", "exit", "/quit", "/exit"):
+            break
+        prompt = _run_command(agent, config, user_input)
+        if prompt is not None:
+            _run_turn(agent, prompt)
+
+
+def _print_banner(agent: Agent, config: Config) -> None:
+    """The startup panel: version, model, consent mode, hooks and MCP."""
     perm = agent.permission
     mode = "auto-approve every tool call (--yes)" if (perm and perm.allow_all) else "ask before mutating tools"
     mcp_count = sum(1 for t in agent.tools if t.name.startswith("mcp__"))
@@ -192,10 +212,9 @@ def _repl(agent: Agent, config: Config):
         border_style="blue",
     ))
 
-    hist_path = os.path.expanduser("~/.corecoder_history")
-    history = FileHistory(hist_path)
 
-    # Enter submits, Escape+Enter inserts a newline (for pasting code blocks etc.)
+def _key_bindings() -> KeyBindings:
+    """Enter submits, Escape+Enter inserts a newline (for pasting code blocks etc.)."""
     kb = KeyBindings()
 
     @kb.add("enter")
@@ -206,147 +225,178 @@ def _repl(agent: Agent, config: Config):
     def _newline(event):
         event.current_buffer.insert_text("\n")
 
-    while True:
-        try:
-            user_input = pt_prompt(
-                "You (plan) > " if agent.plan_mode else "You > ",
-                history=history,
-                multiline=True,
-                key_bindings=kb,
-                prompt_continuation="...  ",
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\nBye!")
-            break
+    return kb
 
-        if not user_input:
-            continue
 
-        # built-in commands
-        if user_input.lower() in ("quit", "exit", "/quit", "/exit"):
-            break
-        if user_input == "/help":
-            _show_help()
-            continue
-        if user_input == "/reset":
-            agent.reset()
-            console.print("[yellow]Conversation reset.[/yellow]")
-            continue
-        if user_input == "/plan":
-            agent.plan_mode = not agent.plan_mode
-            if agent.plan_mode:
-                console.print(
-                    "[yellow]Plan mode on.[/yellow] The agent can look but not touch: it will "
-                    "investigate read-only and present a plan. Type [bold]approve[/bold] to "
-                    "accept the plan, or [bold]/plan[/bold] again to exit."
-                )
-            else:
-                console.print("[yellow]Plan mode off.[/yellow]")
-            continue
-        if agent.plan_mode and user_input.lower() in ("approve", "/approve"):
-            agent.plan_mode = False
-            console.print("[yellow]Plan mode off.[/yellow]")
-            user_input = "approve"  # the approval itself goes to the model, which then executes
-        if user_input == "/tokens":
-            p = agent.llm.total_prompt_tokens
-            c = agent.llm.total_completion_tokens
-            line = f"Tokens: [cyan]{p}[/cyan] prompt + [cyan]{c}[/cyan] completion = [bold]{p+c}[/bold] total"
-            cost = agent.llm.estimated_cost
-            if cost is not None:
-                line += f"  (~${cost:.4f})"
-            console.print(line)
-            continue
-        if user_input == "/model" or user_input.startswith("/model "):
-            new_model = user_input[7:].strip() if user_input.startswith("/model ") else ""
-            if new_model:
-                agent.llm.model = new_model
-                config.model = new_model
-                console.print(f"Switched to [cyan]{new_model}[/cyan]")
-            else:
-                console.print(f"Current model: [cyan]{config.model}[/cyan]")
-            continue
-        if user_input == "/compact":
-            from .context import estimate_tokens
-            before = estimate_tokens(agent.messages)
-            compressed = agent.context.maybe_compress(agent.messages, agent.llm)
-            after = estimate_tokens(agent.messages)
-            if compressed:
-                console.print(f"[green]Compressed: {before} → {after} tokens ({len(agent.messages)} messages)[/green]")
-            else:
-                console.print(f"[dim]Nothing to compress ({before} tokens, {len(agent.messages)} messages)[/dim]")
-            continue
-        if user_input == "/save":
-            sid = save_session(agent.messages, config.model, session_id=agent.session_id)
-            console.print(f"[green]Session saved: {sid}[/green]")
-            console.print(f"Resume with: corecoder -r {sid}")
-            continue
-        if user_input == "/diff":
-            from .tools.edit import _changed_files
-            if not _changed_files:
-                console.print("[dim]No files modified this session.[/dim]")
-            else:
-                console.print(f"[bold]Files modified this session ({len(_changed_files)}):[/bold]")
-                for f in sorted(_changed_files):
-                    console.print(f"  [cyan]{f}[/cyan]")
-            continue
-        if user_input == "/undo":
-            from .checkpoints import pending, undo
-            console.print(undo())
-            left = pending()
-            if left:
-                console.print(f"[dim]{left} more checkpoint(s) on the stack.[/dim]")
-            continue
-        if user_input == "/sessions":
-            sessions = list_sessions()
-            if not sessions:
-                console.print("[dim]No saved sessions.[/dim]")
-            else:
-                for s in sessions:
-                    console.print(f"  [cyan]{s['id']}[/cyan] ({s['model']}, {s['saved_at']}) {s['preview']}")
-            continue
-        if user_input == "/mcp" or user_input.startswith("/mcp "):
-            _mcp(user_input[4:].strip())
-            continue
+def _read_prompt(agent: Agent, history, kb) -> str | None:
+    """One submitted line; None when the user closed the prompt (Ctrl+C / EOF)."""
+    try:
+        return pt_prompt(
+            "You (plan) > " if agent.plan_mode else "You > ",
+            history=history,
+            multiline=True,
+            key_bindings=kb,
+            prompt_continuation="...  ",
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
 
-        # an unknown /command shouldn't be sent to the model as a prompt
-        if user_input.startswith("/"):
-            console.print(f"[yellow]Unknown command: {user_input.split()[0]} (try /help)[/yellow]")
-            continue
 
-        # call the agent
-        streamed: list[str] = []
+def _run_command(agent: Agent, config: Config, text: str) -> str | None:
+    """Run one REPL built-in; return the prompt to send, or None when consumed.
 
-        def on_token(tok, streamed=streamed):
-            streamed.append(tok)
-            print(tok, end="", flush=True)
+    Only ``approve`` returns text: leaving plan mode is not the end of the
+    turn, the approval itself becomes the message the model acts on.
+    """
+    if text == "/help":
+        _show_help()
+    elif text == "/reset":
+        agent.reset()
+        console.print("[yellow]Conversation reset.[/yellow]")
+    elif text == "/plan":
+        _toggle_plan(agent)
+    elif agent.plan_mode and text.lower() in ("approve", "/approve"):
+        return _approve_plan(agent)
+    elif text == "/tokens":
+        _print_tokens(agent)
+    elif text == "/model" or text.startswith("/model "):
+        _switch_model(agent, config, text)
+    elif text == "/compact":
+        _compact_context(agent)
+    elif text == "/save":
+        sid = save_session(agent.messages, config.model, session_id=agent.session_id)
+        console.print(f"[green]Session saved: {sid}[/green]")
+        console.print(f"Resume with: corecoder -r {sid}")
+    elif text == "/diff":
+        _print_changes()
+    elif text == "/undo":
+        _undo_change()
+    elif text == "/sessions":
+        _print_sessions()
+    elif text == "/mcp" or text.startswith("/mcp "):
+        _mcp(text[4:].strip())
+    elif text.startswith("/"):
+        console.print(f"[yellow]Unknown command: {text.split()[0]} (try /help)[/yellow]")
+    else:
+        return text
+    return None
 
-        def on_tool(name, kwargs):
-            console.print(f"\n[dim]> {name}({_brief(kwargs)})[/dim]")
 
-        def on_reasoning(tok, streamed=streamed):
-            # dim the thinking inline; mark the stream non-empty so the final
-            # newline logic below still fires even if the reply itself is empty
-            streamed.append(tok)
-            console.print(f"[dim]{tok}[/dim]", end="")
+def _run_turn(agent: Agent, prompt: str) -> None:
+    """Send one prompt, render the answer, and keep the REPL alive."""
+    streamed: list[str] = []
 
-        try:
-            response = agent.chat(user_input, on_token=on_token, on_tool=on_tool,
-                                  on_reasoning=on_reasoning)
-            if streamed:
-                print()  # newline after streamed tokens
-            else:
-                # response wasn't streamed (came after tool calls)
-                console.print(Markdown(response))
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted.[/yellow]")
-            console.print("[dim]A parallel tool call already running may still finish; "
-                          "re-check the workspace shortly.[/dim]")
-        except TruncatedOutput as e:
-            # the streamed half-answer stays on screen; say why it stopped
-            console.print(f"\n[red]{e}[/red]")
-        except Exception as e:  # noqa: BLE001
-            # keep the REPL alive no matter what chat() throws
-            console.print(f"\n[red]Error: {e}[/red]")
+    def on_token(tok):
+        streamed.append(tok)
+        print(tok, end="", flush=True)
+
+    def on_tool(name, kwargs):
+        console.print(f"\n[dim]> {name}({_brief(kwargs)})[/dim]")
+
+    def on_reasoning(tok):
+        # dim the thinking inline; mark the stream non-empty so the final
+        # newline logic below still fires even if the reply itself is empty
+        streamed.append(tok)
+        console.print(f"[dim]{tok}[/dim]", end="")
+
+    try:
+        response = agent.chat(prompt, on_token=on_token, on_tool=on_tool,
+                              on_reasoning=on_reasoning)
+        if streamed:
+            print()  # newline after streamed tokens
+        else:
+            # response wasn't streamed (came after tool calls)
+            console.print(Markdown(response))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        console.print("[dim]A parallel tool call already running may still finish; "
+                      "re-check the workspace shortly.[/dim]")
+    except TruncatedOutput as e:
+        # the streamed half-answer stays on screen; say why it stopped
+        console.print(f"\n[red]{e}[/red]")
+    except Exception as e:  # noqa: BLE001
+        # keep the REPL alive no matter what chat() throws
+        console.print(f"\n[red]Error: {e}[/red]")
+
+
+def _toggle_plan(agent: Agent) -> None:
+    agent.plan_mode = not agent.plan_mode
+    if agent.plan_mode:
+        console.print(
+            "[yellow]Plan mode on.[/yellow] The agent can look but not touch: it will "
+            "investigate read-only and present a plan. Type [bold]approve[/bold] to "
+            "accept the plan, or [bold]/plan[/bold] again to exit."
+        )
+    else:
+        console.print("[yellow]Plan mode off.[/yellow]")
+
+
+def _approve_plan(agent: Agent) -> str:
+    """Leave plan mode; the approval itself becomes the prompt."""
+    agent.plan_mode = False
+    console.print("[yellow]Plan mode off.[/yellow]")
+    return "approve"
+
+
+def _print_tokens(agent: Agent) -> None:
+    p = agent.llm.total_prompt_tokens
+    c = agent.llm.total_completion_tokens
+    line = f"Tokens: [cyan]{p}[/cyan] prompt + [cyan]{c}[/cyan] completion = [bold]{p+c}[/bold] total"
+    cost = agent.llm.estimated_cost
+    if cost is not None:
+        line += f"  (~${cost:.4f})"
+    console.print(line)
+
+
+def _switch_model(agent: Agent, config: Config, text: str) -> None:
+    new_model = text[7:].strip() if text.startswith("/model ") else ""
+    if not new_model:
+        console.print(f"Current model: [cyan]{config.model}[/cyan]")
+        return
+    agent.llm.model = new_model
+    config.model = new_model
+    console.print(f"Switched to [cyan]{new_model}[/cyan]")
+
+
+def _compact_context(agent: Agent) -> None:
+    from .context import estimate_tokens
+
+    before = estimate_tokens(agent.messages)
+    compressed = agent.context.maybe_compress(agent.messages, agent.llm)
+    after = estimate_tokens(agent.messages)
+    if compressed:
+        console.print(f"[green]Compressed: {before} → {after} tokens ({len(agent.messages)} messages)[/green]")
+    else:
+        console.print(f"[dim]Nothing to compress ({before} tokens, {len(agent.messages)} messages)[/dim]")
+
+
+def _print_changes() -> None:
+    from .tools.edit import _changed_files
+
+    if not _changed_files:
+        console.print("[dim]No files modified this session.[/dim]")
+        return
+    console.print(f"[bold]Files modified this session ({len(_changed_files)}):[/bold]")
+    for f in sorted(_changed_files):
+        console.print(f"  [cyan]{f}[/cyan]")
+
+
+def _undo_change() -> None:
+    from .checkpoints import pending, undo
+
+    console.print(undo())
+    left = pending()
+    if left:
+        console.print(f"[dim]{left} more checkpoint(s) on the stack.[/dim]")
+
+
+def _print_sessions() -> None:
+    sessions = list_sessions()
+    if not sessions:
+        console.print("[dim]No saved sessions.[/dim]")
+        return
+    for s in sessions:
+        console.print(f"  [cyan]{s['id']}[/cyan] ({s['model']}, {s['saved_at']}) {s['preview']}")
 
 
 def _mcp(arg: str):

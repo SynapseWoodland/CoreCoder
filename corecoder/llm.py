@@ -190,39 +190,10 @@ class LLM:
         is display-only: it never enters the history, since providers reject
         it when sent back.
         """
-        params: dict = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            **self.extra,
-        }
-        if tools:
-            params["tools"] = tools
-
-        # Provider-dialect fallbacks. A 400 that quotes a parameter is adapted
-        # (newer OpenAI models take max_completion_tokens, default temperature
-        # only); a 400 that names nothing drops stream_options once, matching
-        # the previous single-fallback behavior for servers that reject the
-        # OpenAI extension silently. The loop is bounded by the param set, and
-        # an unrecognized 400 re-raises instead of doubling _call_with_retry's
-        # exhausted retries. LiteLLM never lands here: drop_params strips
-        # unsupported keys on that path.
-        params["stream_options"] = {"include_usage": True}
+        params = self._request_params(messages, tools)
         last_err = None
         for attempt in range(3):
-            while True:
-                try:
-                    stream = self._call_with_retry(params)
-                    break
-                except BadRequestError as e:
-                    kind = _adapt_rejected_param(params, e)
-                    if kind:
-                        log_event("provider_fallback", kind=kind, attempt=attempt)
-                        continue
-                    if "stream_options" not in params:
-                        raise
-                    params.pop("stream_options")
-                    log_event("provider_fallback", kind="stream_options", attempt=attempt)
+            stream = self._open_stream(params, attempt)
             try:
                 return self._drain(stream, on_token, on_reasoning)
             except (RateLimitError, APITimeoutError, APIConnectionError) as e:
@@ -242,6 +213,44 @@ class LLM:
                            type(last_err).__name__)
                 time.sleep(2**attempt)
         raise last_err
+
+    def _request_params(self, messages: list[dict], tools: list[dict] | None) -> dict:
+        """The kwargs one request is created from."""
+        params: dict = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            **self.extra,
+        }
+        if tools:
+            params["tools"] = tools
+        params["stream_options"] = {"include_usage": True}
+        return params
+
+    def _open_stream(self, params: dict, attempt: int):
+        """Create the stream, adapting a 400 that names a rejected parameter.
+
+        Provider-dialect fallbacks. A 400 that quotes a parameter is adapted
+        (newer OpenAI models take max_completion_tokens, default temperature
+        only); a 400 that names nothing drops stream_options once, matching
+        the previous single-fallback behavior for servers that reject the
+        OpenAI extension silently. The loop is bounded by the param set, and
+        an unrecognized 400 re-raises instead of doubling _call_with_retry's
+        exhausted retries. LiteLLM never lands here: drop_params strips
+        unsupported keys on that path.
+        """
+        while True:
+            try:
+                return self._call_with_retry(params)
+            except BadRequestError as e:
+                kind = _adapt_rejected_param(params, e)
+                if kind:
+                    log_event("provider_fallback", kind=kind, attempt=attempt)
+                    continue
+                if "stream_options" not in params:
+                    raise
+                params.pop("stream_options")
+                log_event("provider_fallback", kind="stream_options", attempt=attempt)
 
     def _drain(self, stream, on_token, on_reasoning) -> LLMResponse:
         """Consume one stream into an LLMResponse."""
