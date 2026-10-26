@@ -183,6 +183,16 @@ def test_audit_events_require_only_the_audit_switch(monkeypatch):
     assert out.getvalue() == before
 
 
+def test_audit_switch_accepts_the_spellings_tracing_also_accepts(monkeypatch):
+    """Both switches read the same helper, so their vocabularies cannot drift."""
+    for value in ("1", "true", "TRUE", "yes", "on", " On "):
+        monkeypatch.setenv("CORECODER_AUDIT", value)
+        assert audit.audit_enabled() is True
+    for value in ("", "0", "false", "no", "enabled", "2"):
+        monkeypatch.setenv("CORECODER_AUDIT", value)
+        assert audit.audit_enabled() is False
+
+
 # ─── 2. decision vocabulary and short-circuit order ─────────────────────────
 
 class TestDecisions:

@@ -27,6 +27,7 @@ from corecoder.tracing import (
     LangfuseTracer,
     NullSpan,
     NullTracer,
+    RunTrace,
     SafeTracer,
     create_tracer,
 )
@@ -466,3 +467,204 @@ def test_span_is_thread_safe_for_parallel_workers(tmp_path):
     assert len(records) == 4
     assert all(r["parent_id"] is None for r in records)
     assert len({r["trace_id"] for r in records}) == 4
+
+
+def test_span_stack_survives_an_out_of_order_close(tmp_path):
+    """A span closed before its child must leave the child as the innermost
+    one, or the audit lines that follow would name a span already finished."""
+    tracer = JsonlTracer(tmp_path / "trace.jsonl")
+    outer = tracer.start("outer")
+    inner = tracer.start("inner")
+    try:
+        outer.end()
+        assert tracing.current_trace_context() == {
+            "trace_id": inner.trace_id, "span_id": inner.span_id}
+    finally:
+        inner.end()
+
+    assert tracing.current_trace_context() is None
+
+
+# ─── RunTrace: the only trace surface business code touches ────────────────
+
+class ReplaySpan(NullSpan):
+    """Records what the adapter asked a span to do."""
+
+    def __init__(self, name, as_type, attrs):
+        self.name = name
+        self.type = as_type
+        self.start_attrs = attrs
+        self.updates: list[dict] = []
+        self.events: list[tuple] = []
+        self.ended = None
+        self.retimed = None
+
+    def update(self, **attrs):
+        self.updates.append(attrs)
+
+    def event(self, name, **fields):
+        self.events.append((name, fields))
+
+    def retime(self, start, end):
+        self.retimed = (start, end)
+
+    def end(self, **attrs):
+        self.ended = attrs
+
+
+class ReplayTracer:
+    capture_content = False
+
+    def __init__(self, capture_content=False):
+        self.capture_content = capture_content
+        self.spans: list[ReplaySpan] = []
+
+    def start(self, name, as_type="span", **attrs):
+        span = ReplaySpan(name, as_type, attrs)
+        self.spans.append(span)
+        return span
+
+    def flush(self):
+        pass
+
+
+def test_runtrace_tool_span_replays_the_interval_a_worker_timed():
+    trace = RunTrace(ReplayTracer())
+    span = trace.tool_span(tool="spy", round_idx=2, args_chars=7,
+                           measured_ms=125.0, started_at=1000.0)
+
+    assert span.name == "tool.spy"
+    assert span.start_attrs == {"round": 2, "args_chars": 7}
+    assert span.retimed == (1000.0, 1000.125)
+
+    late = trace.tool_span(tool="spy", measured_ms=50.0)
+    assert late.retimed[1] - late.retimed[0] == pytest.approx(0.05)
+
+
+def test_runtrace_tool_span_is_untimed_without_a_measurement():
+    span = RunTrace(ReplayTracer()).tool_span(tool="spy")
+    assert span.retimed is None
+    assert span.start_attrs == {"args_chars": 0}
+
+
+def test_runtrace_records_tool_io_only_when_capture_content_is_on():
+    quiet = RunTrace(ReplayTracer())
+    span = quiet.tool_span(tool="spy")
+    quiet.tool_finished(span, tool="spy", call_id="c1", decision="execute",
+                        attrs={"outcome": "ok"},
+                        request_text="ping", response_text="pong")
+    assert "input" not in span.ended and "output" not in span.ended
+    assert span.ended == {"outcome": "ok", "decision": "execute",
+                          "tool": "spy", "call_id": "c1"}
+
+    loud = RunTrace(ReplayTracer(capture_content=True))
+    span = loud.tool_span(tool="spy")
+    loud.tool_finished(span, tool="spy", call_id="c1", decision="execute",
+                       attrs={}, request_text="ping", response_text="pong")
+    assert span.ended["input"] == "ping"
+    assert span.ended["output"] == "pong"
+
+
+def test_runtrace_never_writes_a_refusal_back_as_output():
+    trace = RunTrace(ReplayTracer(capture_content=True))
+    span = trace.tool_span(tool="spy")
+    trace.tool_finished(span, tool="spy", call_id="c1", decision="bad_arguments",
+                        attrs={}, request_text='{"text": "pi', response_text="(no json)")
+
+    assert span.ended["input"] == '{"text": "pi'
+    assert "output" not in span.ended
+
+
+def test_runtrace_tool_failed_closes_with_the_error():
+    trace = RunTrace(ReplayTracer())
+    span = trace.tool_span(tool="spy")
+    trace.tool_failed(span, KeyboardInterrupt())
+
+    assert span.ended == {"error": "KeyboardInterrupt: "}
+
+
+def test_runtrace_snapshots_the_history_only_when_capture_is_on():
+    copied: list = []
+
+    def history():
+        copied.append(True)
+        return [{"role": "user", "content": "hi"}]
+
+    quiet_tracer = ReplayTracer()
+    quiet = RunTrace(quiet_tracer)
+    quiet.start_run(model="m", session_id="s", version="0.8.0", max_rounds=3)
+    with quiet.llm_round(1, model="m", estimated_prompt=12, messages=history) as gen:
+        gen.capture_output("done")
+    assert copied == []
+    assert quiet_tracer.spans[-1].start_attrs == {
+        "round": 1, "model": "m", "estimated_prompt": 12}
+    assert quiet_tracer.spans[-1].updates == []
+
+    loud_tracer = ReplayTracer(capture_content=True)
+    loud = RunTrace(loud_tracer)
+    loud.start_run(model="m", session_id="s", version="0.8.0", max_rounds=3)
+    with loud.llm_round(1, model="m", estimated_prompt=12, messages=history) as gen:
+        gen.capture_output("done")
+    assert copied == [True]
+    assert loud_tracer.spans[-1].updates == [
+        {"input": [{"role": "user", "content": "hi"}]}, {"output": "done"}]
+
+
+def test_runtrace_captures_the_request_only_when_enabled():
+    quiet_tracer = ReplayTracer()
+    quiet = RunTrace(quiet_tracer)
+    quiet.start_run(model="m", session_id="s", version="v", max_rounds=1)
+    quiet.capture_request("hello")
+    assert quiet_tracer.spans[0].updates == []
+
+    loud_tracer = ReplayTracer(capture_content=True)
+    loud = RunTrace(loud_tracer)
+    loud.start_run(model="m", session_id="s", version="v", max_rounds=1)
+    loud.capture_request("hello")
+    assert loud_tracer.spans[0].updates == [{"input": "hello"}]
+
+
+def test_runtrace_drops_events_after_the_run_is_closed():
+    tracer = ReplayTracer()
+    trace = RunTrace(tracer)
+    trace.start_run(model="m", session_id="s", version="v", max_rounds=1)
+    root = tracer.spans[0]
+
+    trace.event("backfill", count=2)
+    trace.end_run(outcome="answer")
+    trace.event("too_late", count=9)
+    trace.end_run()  # closing twice is a no-op, not a second record
+
+    assert [name for name, _ in root.events] == ["backfill"]
+    assert root.ended == {"outcome": "answer"}
+
+
+def test_runtrace_is_a_no_op_while_tracing_is_off():
+    trace = RunTrace(NullTracer())
+    trace.start_run(model="m", session_id="s", version="v", max_rounds=1)
+    trace.capture_request("hello")
+    with trace.llm_round(1, model="m", estimated_prompt=3, messages=dict) as gen:
+        gen.record({"prompt_tokens": 1})
+        gen.capture_output("x")
+    span = trace.tool_span(tool="spy", measured_ms=10.0)
+    trace.tool_finished(span, tool="spy", call_id="c", decision="execute",
+                        attrs={}, request_text="a", response_text="b")
+    trace.tool_failed(span, RuntimeError("late"))
+    trace.event("truncated")
+    trace.end_run(outcome="answer")
+
+    assert tracing.current_trace_context() is None
+
+
+def test_content_capture_switch_accepts_the_shared_spellings(monkeypatch, tmp_path):
+    monkeypatch.setenv("CORECODER_TRACE_CONTENT", "YES")
+    tracer = create_tracer("jsonl", file=str(tmp_path / "trace.jsonl"))
+    assert tracer.capture_content is True
+
+    monkeypatch.setenv("CORECODER_TRACE_CONTENT", "off")
+    tracer = create_tracer("jsonl", file=str(tmp_path / "other.jsonl"))
+    assert tracer.capture_content is False
+
+    monkeypatch.setenv("CORECODER_TRACE_CONTENT", "0")
+    assert create_tracer("jsonl", file=str(tmp_path / "plain.jsonl"),
+                         capture_content=True).capture_content is True
