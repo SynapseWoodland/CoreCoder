@@ -789,6 +789,63 @@ def test_run_summary_covers_answer_truncated_and_interrupted():
     assert _fields(_lines(out3, "run_summary")[0])["outcome"] == "interrupted"
 
 
+def test_run_summary_never_files_a_crash_as_round_exhaustion():
+    """A run that died must not be counted as one that ran out of rounds.
+
+    `_RunStats.outcome` used to default to "max_rounds" and `chat` caught only
+    `(Exception, KeyboardInterrupt)`, so a BaseException that is neither (a tool
+    calling `sys.exit`, a GeneratorExit) slipped past the relabeling while
+    `finally` still wrote the summary: the dashboard reported round exhaustion
+    for a crash, with no error type anywhere.
+    """
+    out = _capture()
+    # the cap genuinely runs out: this is the only run allowed to say so
+    filler = ScriptedLLM([_turn(_tc(call_id="c1")), _turn(_tc(call_id="c2")),
+                          _turn(_tc(call_id="c3"))])
+    assert Agent(llm=filler, tools=[SpyTool()], max_rounds=2).chat("go") == \
+        "(reached maximum tool-call rounds)"
+    exhausted = _fields(_lines(out, "run_summary")[0])
+    assert exhausted["outcome"] == "max_rounds"
+    # the label must be backed by the warning line, or the two sinks drift apart
+    assert len(_lines(out, "max_rounds")) == 1
+
+    out2 = _capture()
+    with pytest.raises(SystemExit):
+        Agent(llm=ScriptedLLM([_turn(_tc())]), tools=[SpyTool(exc=SystemExit(3))],
+              max_rounds=2).chat("go")
+    crashed = _fields(_lines(out2, "run_summary")[0])
+    assert crashed["outcome"] == "error", crashed["outcome"]
+    assert not _lines(out2, "max_rounds"), "a crash is not an exhaustion"
+
+
+def test_run_summary_names_the_error_that_ended_the_run():
+    """`outcome=error` on its own cannot be acted on (3.2 defect 2).
+
+    A provider 400, a crashed UI callback and a tool that dies with `SystemExit`
+    all collapse into the same word. The exception type is already known where
+    the summary is written, so the audit line must carry it too - not only the
+    root span, which the Langfuse side drops anyway.
+    """
+    out = _capture()
+
+    def boom(name, arguments):
+        raise RuntimeError("UI callback crashed")
+
+    with pytest.raises(RuntimeError):
+        Agent(llm=ScriptedLLM([_turn(_tc())]), tools=[SpyTool()]).chat(
+            "go", on_tool=boom)
+
+    summary = _fields(_lines(out, "run_summary")[0])
+    assert summary["outcome"] == "error"
+    assert summary["error_type"] == "RuntimeError"
+
+    # a run that ended cleanly must not look like it carried an error; `None` is
+    # how this audit line already spells "no value" (see cost_usd)
+    out2 = _capture()
+    Agent(llm=ScriptedLLM([LLMResponse(content="done")]), tools=[]).chat("hi")
+    assert _fields(_lines(out2, "run_summary")[0])["error_type"] == "None"
+
+
 def test_run_summary_carries_version_and_build(monkeypatch):
     from corecoder import __version__
 

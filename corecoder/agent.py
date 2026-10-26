@@ -45,7 +45,10 @@ class _RunStats:
 
     started: float
     cost_before: float | None
-    outcome: str = "max_rounds"
+    # "max_rounds" used to be the default, so any escape the except clause in
+    # `chat` missed was reported as a benign round exhaustion; every finish
+    # path now names itself and an unlabeled run stays an error
+    outcome: str = "error"
     error_type: str | None = None
     executed: int = 0        # tool calls that actually ran
     rounds: int = 0
@@ -145,7 +148,10 @@ class Agent:
         run = _RunStats(started=time.perf_counter(), cost_before=self._estimated_cost())
         try:
             return self._run_rounds(run, on_token, on_tool, on_reasoning)
-        except (Exception, KeyboardInterrupt) as e:
+        except BaseException as e:
+            # BaseException, not Exception: a tool or a UI callback can die with
+            # SystemExit or GeneratorExit, and those must not reach the summary
+            # carrying whatever default the dataclass happened to start with
             run.outcome = _outcome_of(e)
             run.error_type = type(e).__name__
             raise
@@ -194,6 +200,7 @@ class Agent:
                 "(CORECODER_MAX_TOKENS) or reduce the request"
             )
         log_event("max_rounds", level=logging.WARNING, rounds=self.max_rounds)
+        run.outcome = "max_rounds"
         return "(reached maximum tool-call rounds)"
 
     def _model_round(self, current_round: int, run, on_token, on_reasoning):
@@ -327,6 +334,9 @@ class Agent:
             build=os.getenv("CORECODER_BUILD", ""),
             model=self._model,
             outcome=run.outcome,
+            # the word "error" on its own is not actionable: a provider 400, a
+            # crashed callback and a tool calling sys.exit would all read alike
+            error_type=run.error_type,
             rounds=run.rounds,
             tool_calls=run.tool_calls,
             tools_executed=run.executed,
