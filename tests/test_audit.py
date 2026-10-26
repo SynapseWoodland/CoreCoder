@@ -597,6 +597,42 @@ def test_default_logs_are_pruned_to_ten_but_explicit_paths_are_kept(monkeypatch,
     assert len(list(explicit_dir.glob("audit.*.log"))) == 13
 
 
+def test_prune_count_is_configurable_and_a_bad_value_falls_back(monkeypatch, tmp_path):
+    """One day of real runs already outgrows the hard-coded cap of ten.
+
+    Ten pid files is under a day of dogfood, so the retention cap has to be a
+    setting rather than a literal — otherwise the audit trail cannot serve as
+    the second copy of a run history the trace backend already keeps.
+    """
+    target = tmp_path / f"audit.{os.getpid()}.log"
+    monkeypatch.setattr(audit, "_default_audit_path", lambda: target)
+    monkeypatch.delenv("CORECODER_AUDIT_FILE", raising=False)
+
+    def seed(count, base=3000):
+        for i in range(count):
+            path = tmp_path / f"audit.{base + i}.log"
+            path.write_text("x", encoding="utf-8")
+            os.utime(path, (2000 + i, 2000 + i))
+
+    monkeypatch.setenv("CORECODER_AUDIT_KEEP", "3")
+    seed(6)
+    audit.configure_audit()
+    assert len(list(tmp_path.glob("audit.*.log"))) == 3
+
+    # the env is read per configure and not cached at import: change it and the
+    # next call must honour the new cap over the files left behind
+    monkeypatch.setenv("CORECODER_AUDIT_KEEP", "5")
+    seed(6)
+    audit.configure_audit()
+    assert len(list(tmp_path.glob("audit.*.log"))) == 5
+
+    # a value that is not a number must not switch retention off altogether
+    monkeypatch.setenv("CORECODER_AUDIT_KEEP", "not-a-number")
+    seed(15, base=4000)
+    audit.configure_audit()
+    assert len(list(tmp_path.glob("audit.*.log"))) == 10
+
+
 # ─── 7. degradation and privacy ────────────────────────────────────────────
 
 class _BrokenStream:

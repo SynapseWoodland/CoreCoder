@@ -179,7 +179,12 @@ def _unlink_quietly(path: Path) -> None:
         pass
 
 
-def prune_old_logs(pattern, keep: int = 10, skip: Path | None = None) -> None:
+# one day of real runs already outgrows ten pid files; CORECODER_AUDIT_KEEP
+# raises the cap, while anyone who never sets it keeps the old behaviour
+_DEFAULT_KEEP = 10
+
+
+def prune_old_logs(pattern, keep: int = _DEFAULT_KEEP, skip: Path | None = None) -> None:
     """Keep the newest ``keep`` files matching ``pattern``, never deleting
     ``skip`` (the file this process just opened). Errors are best-effort."""
     try:
@@ -211,7 +216,10 @@ def _open_audit_file(file=None) -> logging.Handler:
     if explicit is None:
         # pid-suffixed files accumulate over many sessions; size rotation
         # almost never fires for them, so count-based retention is the real cap
-        prune_old_logs(path.parent / "audit.*.log", keep=10, skip=path)
+        # -- and ten of them is less than a day of real runs, so it is a setting
+        prune_old_logs(
+            path.parent / "audit.*.log",
+            keep=_env_int("CORECODER_AUDIT_KEEP", _DEFAULT_KEEP), skip=path)
     return _AuditHandler(fd=fd)
 
 
