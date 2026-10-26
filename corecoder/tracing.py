@@ -253,11 +253,32 @@ class JsonlTracer:
             pass
 
 
+def _native_usage(attrs: dict) -> dict | None:
+    """Move agent token counts onto Langfuse's native ``usage_details``.
+
+    ``usage_reported=False`` means the provider sent no usage and the zeros in
+    ``LLMResponse`` are placeholders, so nothing is invented here: the server
+    keeps its own estimate instead of reporting a made-up zero.
+    """
+    reported = attrs.pop("usage_reported", None)
+    prompt = attrs.pop("prompt_tokens", None)
+    completion = attrs.pop("completion_tokens", None)
+    if reported is False:
+        return None
+    details = {}
+    if prompt is not None:
+        details["input"] = prompt
+    if completion is not None:
+        details["output"] = completion
+    return details or None
+
+
 class _LangfuseSpan(_BaseSpan):
-    def __init__(self, tracer, observation, context, *args):
+    def __init__(self, tracer, observation, context, *args, propagator=None):
         super().__init__(tracer, *args)
         self.observation = observation
         self.context = context
+        self.propagator = propagator
 
     def _apply(self, attrs: dict) -> None:
         attrs = self.tracer._filter(attrs)
@@ -265,6 +286,12 @@ class _LangfuseSpan(_BaseSpan):
         for key in ("model", "input", "output"):
             if key in attrs:
                 payload[key] = attrs.pop(key)
+        usage = _native_usage(attrs)
+        if usage is not None:
+            payload["usage_details"] = usage
+        cost = attrs.pop("cost_usd", None)
+        if cost is not None:
+            payload["cost_details"] = {"total": cost}
         if attrs:
             payload["metadata"] = attrs
         if payload:
@@ -284,6 +311,10 @@ class _LangfuseSpan(_BaseSpan):
     def _close(self) -> None:
         self._apply(self.attrs)
         self.context.__exit__(None, None, None)
+        # the attribute context was opened before the observation, so it must
+        # be closed after it: OTEL contexts unhook in reverse order
+        if self.propagator is not None:
+            self.propagator.__exit__(None, None, None)
 
 
 class LangfuseTracer:
@@ -320,6 +351,34 @@ class LangfuseTracer:
         elif span in stack:
             stack.remove(span)
 
+    def _trace_attributes(self, session_id: str, user_id, tags):
+        """Open trace-level attributes through whichever API this SDK offers.
+
+        3.x exposed ``update_current_trace``; 4.x replaced it with the
+        module-level ``propagate_attributes`` context manager. Neither being
+        present is not an error: the span tree is still worth collecting
+        without trace-level grouping, so this returns None and the root span
+        is created bare.
+        """
+        attrs: dict = {}
+        if session_id:
+            attrs["session_id"] = session_id
+        if user_id:
+            attrs["user_id"] = user_id
+        if tags:
+            attrs["tags"] = tags
+        if not attrs:
+            return None
+        update_trace = getattr(self.client, "update_current_trace", None)
+        if update_trace is not None:
+            update_trace(**attrs)
+            return None
+        try:
+            from langfuse import propagate_attributes
+        except ImportError:
+            return None
+        return propagate_attributes(**attrs)
+
     def start(self, name: str, as_type: str = "span", **attrs) -> _LangfuseSpan:
         stack = self._stack()
         parent = stack[-1] if stack else None
@@ -328,18 +387,31 @@ class LangfuseTracer:
             session_id = parent.session_id if parent is not None else ""
         round_idx = attrs.pop("round", None)
         trace_id = parent.trace_id if parent is not None else uuid.uuid4().hex
+        # user/tags describe the whole exchange, not one step: on a child they
+        # stay metadata, on the root they become trace attributes
+        user_id = attrs.pop("user_id", None) if parent is None else None
+        tags = attrs.pop("tags", None) if parent is None else None
 
-        context = self.client.start_as_current_observation(name=name, as_type=as_type)
-        observation = context.__enter__()
+        propagator = None
+        if parent is None:
+            propagator = self._trace_attributes(session_id, user_id, tags)
+        if propagator is not None:
+            propagator.__enter__()
+        try:
+            context = self.client.start_as_current_observation(
+                name=name, as_type=as_type)
+            observation = context.__enter__()
+        except BaseException:
+            # a half-entered attribute context would leak into every later
+            # span on this thread
+            if propagator is not None:
+                propagator.__exit__(None, None, None)
+            raise
         span = _LangfuseSpan(
             self, observation, context, name, as_type, parent, trace_id,
-            session_id, round_idx)
+            session_id, round_idx, propagator=propagator)
         if round_idx is not None:
             attrs["round"] = round_idx
-        if parent is None and session_id:
-            update_trace = getattr(self.client, "update_current_trace", None)
-            if update_trace is not None:
-                update_trace(session_id=session_id)
         span.update(**attrs)
         stack.append(span)
         return span
