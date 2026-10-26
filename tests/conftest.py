@@ -2,7 +2,7 @@
 
 import pytest
 
-from corecoder import Config, checkpoints, cli
+from corecoder import Config, audit, checkpoints, cli
 from corecoder import llm as llm_module
 from corecoder.tools import ALL_TOOLS
 
@@ -20,6 +20,38 @@ def _checkpoints_isolated(tmp_path, monkeypatch):
 def _pricing_isolated(tmp_path, monkeypatch):
     """Cost estimates must never read the real ~/.corecoder/pricing.json."""
     monkeypatch.setattr(llm_module, "PRICING_FILE", tmp_path / "pricing.json")
+
+
+@pytest.fixture(autouse=True)
+def _observability_isolated(tmp_path, monkeypatch):
+    """Audit and trace must never reach the real ~/.corecoder or Langfuse.
+
+    Most tests build an Agent without a tracer, and Agent.__init__ then falls
+    back to create_tracer(), which reads the developer's .env: audit on, trace
+    pointed at langfuse with content capture. Without this fixture one run of
+    the suite is indistinguishable from real usage in both streams.
+    """
+    monkeypatch.setenv("CORECODER_AUDIT_FILE", str(tmp_path / "audit.log"))
+    # retention is a per-developer knob, so an inherited value would move the
+    # file counts the pruning tests assert on
+    monkeypatch.delenv("CORECODER_AUDIT_KEEP", raising=False)
+    # a stderr sink outranks the file in audit._build_handler, so an inherited
+    # switch here would send the lines past the redirect above
+    monkeypatch.delenv("CORECODER_AUDIT_STREAM", raising=False)
+    # the general logger gets its own file only when opted in, but that opt-in
+    # belongs to the developer's shell, not to a test run
+    monkeypatch.delenv("CORECODER_LOG_FILE", raising=False)
+    # the langfuse backend ignores CORECODER_TRACE_FILE entirely, so redirecting
+    # the path alone would still upload: only "off" keeps the suite out
+    monkeypatch.setenv("CORECODER_TRACE", "off")
+    monkeypatch.delenv("CORECODER_TRACE_FILE", raising=False)
+    monkeypatch.delenv("CORECODER_TRACE_CONTENT", raising=False)
+    # in case a test re-enables it: keep the pool separate from real runs
+    monkeypatch.setenv("LANGFUSE_TRACING_ENVIRONMENT", "test")
+    # the sink is cached in module state, so re-pointing the env needs a reset
+    audit.reset_audit()
+    yield
+    audit.reset_audit()
 
 
 def get_tool(name: str):
