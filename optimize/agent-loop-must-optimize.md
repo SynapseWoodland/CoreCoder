@@ -2,7 +2,7 @@
 
 - 审查对象：`corecoder/agent.py` 中 `Agent.chat()` 主循环（v1.0 写作时为第 70–124 行，v1.2 实测为第 77–138 行）及其直接依赖
 - 审查基线：当前工作区 `main` 分支；文中行号均为写作时实测值
-- 文档版本：v1.4（2026-10-24）。v1.0 为审查定稿；v1.1 为 M2 实施后的复核回写，新增 0.5 节与 4.f 节，并同步第 7、9、10 节；v1.2 为 M1 实施后的回写，把第 3、7、8 节的状态改为已实施，并同步实测测试数；v1.3 为 M3 实施后的回写，更新第 2、5、7、8 节与 4.f.2 的组表，并同步 10.2、10.5 的实测值；v1.4 为 M4 实施后的回写，更新第 2、6、7、8 节与 4.f.2 的组表，并同步 10.2、10.5 的实测值
+- 文档版本：v1.5（2026-10-24）。v1.0 为审查定稿；v1.1 为 M2 实施后的复核回写，新增 0.5 节与 4.f 节，并同步第 7、9、10 节；v1.2 为 M1 实施后的回写，把第 3、7、8 节的状态改为已实施，并同步实测测试数；v1.3 为 M3 实施后的回写，更新第 2、5、7、8 节与 4.f.2 的组表，并同步 10.2、10.5 的实测值；v1.4 为 M4 实施后的回写，更新第 2、6、7、8 节与 4.f.2 的组表，并同步 10.2、10.5 的实测值；v1.5 为第 9 节残留项落地的回写：可观测性、Ctrl+C 取消与 R3 已实施，R8 的示例修复已核实，R6/R7 仍按原决定不做
 - 读者：未参与前序讨论、需要直接实施改造的工程师
 - 路径约定：除特别说明外，所有路径相对仓库根目录 `D:\github\CoreCoder`
 
@@ -15,6 +15,8 @@
 > v1.3 增补：M3 已按第 5 节实施（请求级兜底 + 固定开销计入估算）。实施记录、组 11 的 6 条用例与实测结果回写在 5.c–5.e；第 2、7、8 节标为已实施，4.f.2 的组表、10.2 的 grep 预期与 10.5 的行数同步为实测值。
 >
 > v1.4 增补：M4 已按第 6 节实施（工具结果出口统一封顶与脱敏 + `read_file` 文件大小上限）。实施记录、组 12 的 6 条用例与实测结果回写在 6.c–6.e；第 2、7、8 节标为已实施，4.f.2 的组表、10.2 的 grep 预期与 10.5 的行数同步为实测值。至此 4 项必须优化全部实施完成；第 9 节的残留项保持原样。
+>
+> v1.5 增补：第 9 节的残留项按评审后的取舍落地——可观测性（审计事件、成本与 `run_summary`、trace 接口 + JSONL/Langfuse 适配器）、并行工具的 Ctrl+C 取消、R3 坏参数 head+tail 诊断均已实施；R8（`examples/m2` 判定失效）已在 `82f2c7f` 修复，本次只做核实；R6/R7 按原决定不做。新增用例分布见各提交与 `tests/test_interrupt_cancel.py`、`tests/test_bad_argument_diagnostics.py`；全量与真实 provider 脚本实测值见 10.5。
 
 ## 0. 与上一轮审查的对应关系
 
@@ -990,22 +992,22 @@ fix(agent): clamp and redact tool results                  # M4 已完成 ✔
 
 ## 9. 本轮取舍
 
-以下问题不在 4 项必须清单内，本轮明确不处理。v1.1 追加的条目带 R 编号与复核严重度（P2/P3，见 0.5）；其中 R3、R6、R7、R8 未实施，R5 已随 R2 一并修掉（见 4.f.2）。
+以下问题不在 4 项必须清单内，v1.1 追加的条目带 R 编号与复核严重度（P2/P3，见 0.5）。**v1.5 状态**：可观测性、Ctrl+C 取消、R3 已实施；R8 已在 `82f2c7f` 修复并核实；R6、R7 与工具实例共享、LLM client 超时、估算精度、post-hook 原文等仍按原决定不做（R5 已随 R2 一并修掉，见 4.f.2）。
 
 | 问题 | 现状与位置 | 为什么不处理 | 残留风险 |
 |---|---|---|---|
 | `max_rounds` 触顶体验（R5 已部分修复） | **v1.1**：截断轮触顶改为抛 `TruncatedOutput`（`agent.py:126-133`）；纯触顶（非截断）仍返回裸字符串 `agent.py:134`；子 agent 固定 20 轮 `tools/agent.py:50` | 纯触顶属体验与预算议题，不影响正确性 | 用户可能把“纯触顶”当成正常完成；裸字符串返回值仍会被上层丢弃，嵌入方需要自己判断 |
-| 可观测性 | `agent.py` 无 `logging`；token 总量在 `llm.py:269-270` | 工作量大，需先定日志 schema 与采样策略 | 线上问题只能靠复现；无 trace id、无每轮耗时、无成本归因 |
-| 线程池超时与取消 | `max_workers=8` `agent.py:190`；`future.result()` `209` | 涉及取消传播与线程模型，改动面大 | 不自带超时的工具（尤其 MCP）可能挂住；Ctrl+C 需等批次结束 |
+| 可观测性（已实施，v1.5） | `corecoder/audit.py`（原名 `observability.py`，其后重命名）：审计事件（`tool_decision`/`tool_result`/`llm_call`/`run_summary`/`backfill`/`batch_interrupted`）、`usage_reported` 与成本差额；`corecoder/tracing.py`：`Tracer` 接口、`NullTracer`、JSONL、Langfuse v3 适配器。审计与 trace 默认关闭，分别由 `CORECODER_AUDIT`、`CORECODER_TRACE` 打开 | 已按“元数据默认、内容显式开启”落地；`CORECODER_TRACE_CONTENT=1` 才捕获输入输出 | trace 的脱敏只有四类模式，不能当作合规边界；`CORECODER_TRACE=langfuse` 未对真实 SaaS 做端到端验证 |
+| 线程池超时与取消（取消已实施，v1.5） | 取消：`_exec_tools_parallel` 改用显式池，`shutdown(wait=False, cancel_futures=True)`，等待改为 0.1s 轮询以便及时投递 Ctrl+C，逃逸时记 `event=batch_interrupted`。工具自身的期限仍未实现 | 线程无法被杀，做“超时”只能停止等待、不能停止副作用；业界通常把期限放在工具层或 opt-in | 已运行的工具可能继续写工作区（CLI 已提示）；不自带超时的 MCP 工具仍可挂住，只是不再阻塞 Ctrl+C |
 | LLM client 超时 | `llm.py:130` 未显式设置 | 属“建议优化”；SDK 有默认值 | 流式卡死时依赖 SDK 默认行为 |
 | 工具实例共享 | `ALL_TOOLS` 单例；`_parent_agent` 写回 `agent.py:47-49` | 单会话 CLI 不受影响 | 同进程多 Agent 或多会话会串状态 |
 | 估算精度 | `context.py:28-45` 启发式 | M3 的 fixed_tokens 缓解漏算，但估算仍是近似 | 阈值附近可能抖动；极端内容仍可能低估 |
 | 并行 `on_tool` 语义（含 R6，P3） | 单工具 fire 一次 `agent.py:155-156`；并行先 fire 全部 `agent.py:256-258`。**v1.1**：`on_tool` 仍早于坏参数判定，被拒调用也会在 CLI 打印成一行 `> tool()`（`cli.py:315-316`） | 仅影响 UI 展示 | 用户可能看到“即将执行”但随后被拒绝的调用；把 `on_tool` 挪到 `_bad_arguments` 之后、或打印成 `<invalid args>` 会更诚实 |
 | LLM 失败后未应答的 user 消息 | `agent.py:72` 已写入，失败后保留 | API 可接受连续 user 消息，不导致 400 | 历史语义略怪；重试时可能重复上下文 |
 | post-hook 看到治理后文本 | M4 的取舍 | 安全优先，避免密钥流向 hook | 需要原文审计的场景需等 M4-full 的 `ToolResult.raw_text` |
-| `raw_arguments` 无下游消费者（R3，P2） | 字段注释写“kept for audit”（`llm.py:25-26`），但全仓无任何读取方；真正落盘的只有 `LLMResponse.message` 里 `json.dumps(tc.arguments)` 重建出的 `{}`（`llm.py:40-56`），`/save` 保存的也是同一份 | 属可观测性议题（上上行），引入日志出口工作量大，需先定 schema 与采样策略 | 模型回看历史时看到的是“我发了一个合法的空参数调用”，而 tool 回复却说参数坏了；需要必填参数的工具会再发一次 `{}`，把轮次烧在 bind 报错上。修法建议：把拒绝文案的 200 字符截断改成 head+tail（截断场景下切点比开头有用），并把注释改成“仅内存可见”或直接删掉该字段，避免注释与实现不一致 |
+| `raw_arguments` 无下游消费者（R3，已实施，v1.5） | 拒绝文案改为 head+tail：≤200 字符整段回显，超长时保留首 120 + 尾 80 并标注 `(N chars total)`；闸门仍是 `arguments_error`，`raw_arguments` 只用于显示（合法调用也带原文，不能据此拒绝）；`llm.py` 注释改为“仅内存保留，供拒绝文案与可选 trace”；trace 的坏参数 tool span 不写 output，捕获历史用占位符替代拒绝文案 | 已按修法建议落地 | 拒绝文案仍会把原文回显给模型（模型自己生成的，未新增泄露面）；审计只记元数据，trace 默认为空 |
 | pre-hook 看不到被拒调用（R7，P3） | `_bad_arguments` 在 `_pre_hooks` 之前短路（`agent.py:159-161,263-265`），被拒调用不触发任何 hook，也不弹权限确认 | 短路是有意设计，已被 `test_malformed_arguments_do_not_reach_hooks_or_permission` 钉住；改回会让用户批准一次参数已知损坏的调用（见 4.f.1） | 把 PreToolUse hook 当审计日志用的安装，这类调用将完全不可见；另外 plan mode 下坏参数调用拿到的是“请重发”文案而非“plan mode 只读”，模型可能多试一次。两者都只影响噪声与审计，不影响安全 |
-| `examples/m2` 判定逻辑失效（R8，P3） | phase 1 靠 `note_tool.calls[0]["text"].startswith("(empty arguments")` 判定命中 | 属示例文档老化，不影响引擎；该文件不在本轮 diff 内 | 修复后坏调用永不执行，`calls` 恒为空，脚本会稳定落到“never emitted a truncated tool call”并 `return 2`，第二次截断抛出的 `TruncatedOutput` 又被 L176 的 `except Exception` 吃掉、只打印成“request failed”。会误导后来读者，建议改写成“修复后应观察到 X”的断言脚本 |
+| `examples/m2` 判定逻辑失效（R8，已修复，`82f2c7f`） | phase 1 已改为“修复后应观察到 X”的断言，不再依赖坏调用被执行 | 已核实：离线运行不再因旧判定落到 `return 2` | 无（仅示例文档老化，不影响引擎） |
 
 ## 10. 待核实事项与核实命令
 
@@ -1037,24 +1039,25 @@ git grep -n "context_length" corecoder tests
 git grep -n "max_rounds" tests
 ```
 
-**v1.4 实测预期**（`git grep -c` 逐文件）：
+**v1.5 实测预期**（`git grep -c` 逐文件）：
 
 | 关键词 | 预期 | 说明 |
 |---|---|---|
-| `finish_reason` | `corecoder/llm.py` 6 处、`corecoder/agent.py` 1 处、测试 36 处 | 已实现（M2） |
-| `arguments_error` | `corecoder/llm.py` 2 处、`corecoder/agent.py` 1 处 | 已实现（R1） |
-| `TruncatedOutput` | `corecoder/agent.py` 3 处、`corecoder/cli.py` 3 处、`corecoder/__init__.py` 2 处、测试 6 处 | 已实现（R2）；三处接线缺一处即静默失败回归 |
+| `finish_reason` | `corecoder/llm.py` 6 处、`corecoder/agent.py` 3 处、`tests/test_agent_loop_hardening.py` 36 处（另 `test_audit.py` 4、`test_tracing.py` 1） | 已实现（M2） |
+| `arguments_error` | `corecoder/llm.py` 2 处、`corecoder/agent.py` 1 处、测试 4 处 | 已实现（R1）；R3 只改拒绝文案，闸门仍是这一处 |
+| `TruncatedOutput` | `corecoder/agent.py` 4 处、`corecoder/cli.py` 3 处、`corecoder/__init__.py` 2 处、测试 8 处 | 已实现（R2）；三处接线缺一处即静默失败回归 |
 | `context_length` | `corecoder/agent.py` 2 处、`corecoder/llm.py` 2 处 | 已实现（M3，v1.3） |
 | `force_collapse` | `corecoder/context.py` 1 处、`corecoder/agent.py` 1 处、测试 1 处 | M3 新增的公共强制压缩入口 |
-| `fixed_tokens` | `corecoder/context.py` 5 处、`corecoder/agent.py` 2 处、测试 2 处 | M3 的固定开销估算；若 agent 侧为 0，说明未计入固定开销 |
+| `fixed_tokens` | `corecoder/context.py` 9 处、`corecoder/agent.py` 2 处、测试 2 处 | M3 的固定开销估算；若 agent 侧为 0，说明未计入固定开销 |
 | `max_tool_result_chars` | `corecoder/agent.py` 3 处 | **已实现（M4，v1.4）**：构造参数、实例属性、封顶判断 |
 | `_govern_result` | `corecoder/agent.py` 2 处 | **M4 的唯一治理出口**；若 `_exec_tool` 不调用它，封顶与脱敏都不会发生 |
-| `_redact` | `corecoder/agent.py` 2 处（含 `_REDACTIONS` 定义行）、测试 1 处 | M4 脱敏；测试命中处是 `--no-redact` 的 patch 目标 |
+| `_redact` | `corecoder/agent.py` 3 处（含 `_REDACTIONS` 定义行与 trace 输入）、测试 2 处 | M4 脱敏；测试命中处是 `--no-redact` 的 patch 目标与 trace 捕获 |
 | `_MAX_FILE_BYTES` | `corecoder/tools/read.py` 3 处、测试 1 处 | M4 的 `read_file` 大小上限 |
-| `max_rounds` | `tests/test_live_smoke.py` 1 处、`tests/test_agent_loop_hardening.py` 3 处（组 3 的 `max_rounds=10`、组 9 的 `max_rounds=1`、一处注释） | **注意：`git grep` 只搜已跟踪文件**。两文件共 4 处；若只命中 1 处，先确认测试文件是否被忽略 |
-| `except KeyboardInterrupt` | `corecoder/agent.py` 0 处 | **M1 实施的直接标志**：v1.0 这里命中 1 处（仅 Ctrl+C 回填）；v1.2 起改为 `try/finally`，因此 0 命中 |
+| `max_rounds` | `corecoder/agent.py` 7 处、`corecoder/tools/agent.py` 1 处、测试 13 处 | **注意：`git grep` 只搜已跟踪文件**；测试分散在 hardening / live_smoke / audit（原 observability）/ tracing / interrupt / bad_argument 六个文件 |
+| `except KeyboardInterrupt` | `corecoder/agent.py` 1 处、`corecoder/cli.py` 2 处 | **回填已不靠它**：agent 侧那一处只给 `run_summary` 标 `outcome=interrupted`；回填仍是 `try/finally`。CLI 两处是用户可见的 Interrupted 分支 |
+| `batch_interrupted` | `corecoder/agent.py` 2 处、测试 4 处 | v1.5 的并行批次中断事件；若 agent 侧为 0，说明 Ctrl+C 又变回阻塞 |
 
-v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder` 下为 0 命中；`max_rounds` 在离线测试中为 0 命中”。M2、R1/R2、M3 与 M4 实施后，表中所有“实现类”关键词都不再是 0。
+v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder` 下为 0 命中；`max_rounds` 在离线测试中为 0 命中”。M2、R1/R2、M3、M4 与 v1.5 的三项实施后，表中所有“实现类”关键词都不再是 0。
 
 ### 10.3 provider 的 context-length 文案
 
@@ -1075,6 +1078,8 @@ v1.0 在这里的预期是“`finish_reason` 与 `context_length` 在 `corecoder
 **v1.3**：M3 实施后重新实测为 `agent.py` 345 行、`context.py` 230 行、`llm.py` 392 行、`cli.py` 400 行、`tests/test_agent_loop_hardening.py` 681 行。第 5 节与 4.f.2 的组表已按本次实测更新；第 6 节（M4）与 4.a–4.e 的行号仍是 v1.0 的写作时值，实施 M4 前必须按 10.2 重新定位。
 
 **v1.4**：M4 实施后重新实测为 `agent.py` 383 行、`context.py` 230 行、`llm.py` 392 行、`cli.py` 400 行、`tools/read.py` 64 行、`tests/test_agent_loop_hardening.py` 824 行。第 6 节、第 7 节与 4.f.2 的组表已按本次实测更新；3.a 与 4.a–4.e 的修复前存档行号保持不变。
+
+**v1.5**：第 9 节残留项落地后重新实测为 `agent.py` 794 行、`context.py` 242 行、`llm.py` 420 行、`cli.py` 410 行、`tools/read.py` 64 行、`observability.py` 258 行、`tracing.py` 424 行、`tests/test_agent_loop_hardening.py` 824 行；全量 `pytest -q` 为 **322 passed / 1 skipped**（31.70s），`ruff check corecoder tests` 通过（venv 内 0.17 与 PATH 0.15 均通过）。真实 provider 脚本：`m5_observability_audit.py` 默认/注入/降级三段通过，`m6_interrupt_cancel.py` 默认/`--signal`/`--blocking-shutdown` 通过，`m7_bad_argument_diagnostics.py` 默认/`--head-only` 通过。第 2–6 节的行号仍是各自版本实施时的实测值，继续改动前必须按 10.2 重新定位。
 
 ## 附录 A：人工验证探针
 
