@@ -1,0 +1,173 @@
+# CoreCoder 本地可观测性后端：自托管 Langfuse v3（不依赖任何境外服务）
+#
+# 启动：  docker compose up -d
+# 查看：  docker compose ps      /  docker compose logs -f langfuse-web
+# 停止：  docker compose down            # 保留数据卷
+# 清空：  docker compose down -v         # 数据和账号一起删掉
+#
+# 起来之后：浏览器打开 http://localhost:3000
+#   登录账号   admin@corecoder.local / corecoder123（首启自动创建）
+#   首启还会自动建好项目和密钥，不用手工点 UI：
+#     public key = pk-lf-corecoder-local
+#     secret key = sk-lf-corecoder-local
+#
+# 国内拉镜像慢或被墙时，把下面 image 里的 docker.io / 官方前缀换成加速地址，例如：
+#   docker.io/langfuse/langfuse:3  ->  docker.m.daocloud.io/langfuse/langfuse:3
+#   clickhouse/clickhouse-server:24.12 -> docker.m.daocloud.io/clickhouse/clickhouse-server:24.12
+# 或者在 Docker Desktop -> Settings -> Docker Engine 里配置 "registry-mirrors"。
+# 注意：以上账号、密钥、SALT、ENCRYPTION_KEY 只适合本机自用，不要带到公网环境。
+
+name: corecoder-langfuse
+
+services:
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on: &langfuse-depends-on
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      <<: &langfuse-env
+        # --- 数据库 / 队列 ---
+        DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+        REDIS_HOST: redis
+        REDIS_PORT: 6379
+        REDIS_AUTH: corecoder-redis
+        REDIS_TLS_ENABLED: "false"
+        # --- 加密 / 会话（本地固定值，换机器请重新生成）---
+        SALT: corecoder-local-salt
+        ENCRYPTION_KEY: 6f1d3c9a2b7e45d8a1c0f3b6e9d2478c5a0b1e2d3f4a5b6c7d8e9f0a1b2c3d4e
+        # --- ClickHouse ---
+        CLICKHOUSE_URL: http://clickhouse:8123
+        CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+        CLICKHOUSE_USER: clickhouse
+        CLICKHOUSE_PASSWORD: clickhouse
+        CLICKHOUSE_CLUSTER_ENABLED: "false"
+        CLICKHOUSE_DB: default
+        # --- S3（MinIO）存事件与媒体 ---
+        LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+        LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+        LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+        LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+        LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+        LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+        LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+        LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+        LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+        LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+        LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+        LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+        LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+        LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+        # --- 断网友好 ---
+        TELEMETRY_ENABLED: "false"
+        LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      # --- Web 独有 ---
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: corecoder-local-nextauth-secret
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+      # --- 首启自动创建组织 / 项目 / API Key ---
+      LANGFUSE_INIT_ORG_ID: corecoder
+      LANGFUSE_INIT_ORG_NAME: CoreCoder
+      LANGFUSE_INIT_PROJECT_ID: corecoder-local
+      LANGFUSE_INIT_PROJECT_NAME: CoreCoder Local
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-corecoder-local
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-corecoder-local
+      LANGFUSE_INIT_USER_EMAIL: admin@corecoder.local
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: corecoder123
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on: *langfuse-depends-on
+    environment:
+      <<: *langfuse-env
+    # worker 不需要暴露端口；想看日志直接 docker compose logs -f langfuse-worker
+
+  postgres:
+    image: docker.io/postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      TZ: Asia/Shanghai
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:24.12
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      TZ: Asia/Shanghai
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: docker.io/redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "corecoder-redis", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a corecoder-redis ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  minio:
+    image: docker.io/minio/minio:latest
+    restart: unless-stopped
+    # entrypoint + mkdir：先建好 langfuse bucket，再起服务
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    ports:
+      # MinIO 控制台，排查 S3 问题时才需要
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  clickhouse_logs:
+  redis_data:
+  minio_data:
