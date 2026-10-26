@@ -146,7 +146,7 @@ class Agent:
         self.messages.append({"role": "user", "content": user_input})
         self._trace.start_run(
             model=self._model, session_id=self.session_id,
-            version=__version__, max_rounds=self.max_rounds)
+            version=__version__, max_rounds=self.max_rounds, **self._labels())
         self._trace.capture_request(user_input)
         run = _RunStats(started=time.perf_counter(), cost_before=self._estimated_cost())
         try:
@@ -167,6 +167,25 @@ class Agent:
     def _model(self) -> str:
         """The model name as the audit line and the span both report it."""
         return getattr(self.llm, "model", "")
+
+    @staticmethod
+    def _labels() -> dict:
+        """The trace-level grouping a run carries, read where the audit reads.
+
+        ``CORECODER_BUILD`` is what separates a dogfood trace from a demo one in
+        the list view; the trace tag carries the ``build:`` prefix because a bare
+        word there is indistinguishable from any other tag. ``CORECODER_USER`` is
+        opt-in: a person's name is not something to attach to telemetry by
+        default, so it appears only when it was explicitly supplied.
+        """
+        labels: dict = {}
+        build = os.getenv("CORECODER_BUILD", "").strip()
+        if build:
+            labels["tags"] = [f"build:{build}"]
+        user = os.getenv("CORECODER_USER", "").strip()
+        if user:
+            labels["user_id"] = user
+        return labels
 
     def _run_rounds(self, run, on_token, on_tool, on_reasoning) -> str:
         """Drive LLM and tool rounds until the model answers or the cap hits."""

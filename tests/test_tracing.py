@@ -771,3 +771,49 @@ def test_sub_agent_traces_into_the_parents_tree(tmp_path):
     assert child["parent_id"] == tools[0]["span_id"]
     assert {r["trace_id"] for r in records} == {root["trace_id"]}
     assert {r["session_id"] for r in records} == {"parent-s"}
+
+
+def test_the_run_is_tagged_and_attributed_at_trace_level(monkeypatch):
+    """`CORECODER_BUILD` and `CORECODER_USER` label the trace, not just the log (B8).
+
+    The attribute channel and its tests already existed; nothing ever fed it,
+    so every dogfood trace arrived with empty tags and no user to filter by.
+    The loop reads the two variables, which is where the audit line already
+    reads the first one.
+    """
+    monkeypatch.setenv("CORECODER_BUILD", "dogfood")
+    monkeypatch.setenv("CORECODER_USER", "synapse")
+    client = FakeLangfuse()
+    agent = make_agent(LangfuseTracer(client=client))
+
+    agent.chat("go")
+
+    expected = {"session_id": agent.session_id, "user_id": "synapse",
+                "tags": ["build:dogfood"]}
+    assert client.trace_updates == [expected]
+
+
+def test_no_labels_are_invented_when_the_environment_is_silent(monkeypatch):
+    """A name is personal data, so it appears only when it was supplied."""
+    monkeypatch.delenv("CORECODER_BUILD", raising=False)
+    monkeypatch.delenv("CORECODER_USER", raising=False)
+    client = FakeLangfuse()
+    agent = make_agent(LangfuseTracer(client=client))
+
+    agent.chat("go")
+
+    assert client.trace_updates == [{"session_id": agent.session_id}]
+
+
+def test_runtrace_forwards_labels_supplied_by_the_caller(monkeypatch):
+    """`RunTrace` passes labels through and reads no environment of its own."""
+    monkeypatch.setenv("CORECODER_BUILD", "should-not-be-read")
+    client = FakeLangfuse()
+    trace = RunTrace(LangfuseTracer(client=client))
+
+    trace.start_run(model="m", session_id="s", version="v", max_rounds=2,
+                    tags=["manual"], user_id="u")
+    trace.end_run(outcome="answer")
+
+    assert client.trace_updates == [{"session_id": "s", "user_id": "u",
+                                     "tags": ["manual"]}]

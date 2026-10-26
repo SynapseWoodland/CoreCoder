@@ -669,11 +669,22 @@ class RunTrace:
         self._root = None
 
     # ── one chat run ──────────────────────────────────────────────────────
-    def start_run(self, *, model, session_id, version, max_rounds) -> None:
-        """Open the root span the whole run hangs from."""
+    def start_run(self, *, model, session_id, version, max_rounds,
+                  tags=None, user_id=None) -> None:
+        """Open the root span the whole run hangs from.
+
+        ``tags`` and ``user_id`` describe the exchange rather than one step, and
+        the caller supplies them: this module reads no labelling environment, so
+        changing what a run is grouped by stays one module's decision.
+        """
+        labels: dict = {}
+        if tags:
+            labels["tags"] = tags
+        if user_id:
+            labels["user_id"] = user_id
         self._root = self._tracer.start(
             "agent.chat", model=model, session_id=session_id,
-            version=version, max_rounds=max_rounds)
+            version=version, max_rounds=max_rounds, **labels)
 
     def capture_request(self, text: str) -> None:
         """Record the user message that opened the run."""

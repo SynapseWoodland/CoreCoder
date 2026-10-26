@@ -48,6 +48,11 @@ def _observability_isolated(tmp_path, monkeypatch):
     monkeypatch.delenv("CORECODER_TRACE_CONTENT", raising=False)
     # in case a test re-enables it: keep the pool separate from real runs
     monkeypatch.setenv("LANGFUSE_TRACING_ENVIRONMENT", "test")
+    # both label the trace itself, and run_summary reads CORECODER_BUILD, so an
+    # inherited value would put a developer's tag into the assertions about runs
+    # that supplied no label at all
+    monkeypatch.delenv("CORECODER_BUILD", raising=False)
+    monkeypatch.delenv("CORECODER_USER", raising=False)
     # the sink is cached in module state, so re-pointing the env needs a reset
     audit.reset_audit()
     yield
