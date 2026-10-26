@@ -347,6 +347,16 @@ class _LangfuseSpan(_BaseSpan):
         self.observation = observation
         self.context = context
         self.propagator = propagator
+        # the audit log quotes these as its join keys, so they have to be the
+        # ids the backend itself uses: an id it never heard of is a link that
+        # 404s. An SDK exposing no public ids keeps our own rather than losing
+        # the key entirely.
+        backend_trace_id = getattr(observation, "trace_id", None)
+        if backend_trace_id:
+            self.trace_id = str(backend_trace_id)
+        backend_span_id = getattr(observation, "id", None)
+        if backend_span_id:
+            self.span_id = str(backend_span_id)
 
     def _apply(self, attrs: dict) -> None:
         attrs = self.tracer._filter(attrs)

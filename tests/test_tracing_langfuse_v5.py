@@ -18,7 +18,13 @@ import types
 
 import pytest
 
-from corecoder.tracing import LangfuseTracer, NullTracer, SafeTracer, create_tracer
+from corecoder.tracing import (
+    LangfuseTracer,
+    NullTracer,
+    SafeTracer,
+    create_tracer,
+    current_trace_context,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -30,10 +36,15 @@ def clean_env(monkeypatch):
 
 
 class FakeObservation:
-    def __init__(self, name, as_type, order):
+    """A 5.x observation. The two id fields are public, and the audit log has to
+    quote the backend's own values rather than a uuid we minted ourselves."""
+
+    def __init__(self, name, as_type, order, trace_id=None, observation_id=None):
         self.name = name
         self.as_type = as_type
         self.order = order
+        self.trace_id = trace_id
+        self.id = observation_id
         self.updates = []
         self.events = []
 
@@ -61,13 +72,18 @@ class FakeObservationCM:
 class FakeClient5:
     """The 5.0.4 client surface, deliberately without update_current_trace."""
 
+    expose_ids = True
+
     def __init__(self):
         self.order = []
         self.observations = []
         self.flushed = 0
+        self.trace_id = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
 
     def start_as_current_observation(self, *, name, as_type="span", **kwargs):
-        observation = FakeObservation(name, as_type, self.order)
+        ids = ((self.trace_id, f"{len(self.observations):016x}")
+               if self.expose_ids else (None, None))
+        observation = FakeObservation(name, as_type, self.order, *ids)
         self.observations.append(observation)
         return FakeObservationCM(observation, self.order)
 
@@ -244,3 +260,41 @@ def test_no_trace_attribute_api_at_all_still_traces(monkeypatch):
 
 def test_factory_still_degrades_without_keys():
     assert isinstance(create_tracer("langfuse"), NullTracer)
+
+
+def test_audit_join_keys_are_the_backends_own_ids(monkeypatch):
+    """The ids the audit log quotes must be the ones the trace UI can find (C2).
+
+    We minted a uuid and never told the SDK, which kept its own; every trace_id
+    in the audit log was then a dead link against the REST API, so joining an
+    audit row to its trace meant pasting an id that 404s.
+    """
+    client = FakeClient5()
+    install_fake_langfuse(monkeypatch, client)
+    tracer = LangfuseTracer()
+
+    root = tracer.start("agent.chat", session_id="s-1")
+    child = tracer.start("llm.round", as_type="generation")
+
+    assert root.trace_id == client.trace_id
+    assert child.trace_id == client.trace_id
+    assert root.span_id == client.observations[0].id
+    assert child.span_id == client.observations[1].id
+    assert current_trace_context() == {"trace_id": client.trace_id,
+                                       "span_id": child.span_id}
+    child.end()
+    root.end()
+
+
+def test_ids_stay_our_own_when_the_sdk_shows_none(monkeypatch):
+    """An older client without public ids must not lose the key entirely."""
+    client = FakeClient5()
+    client.expose_ids = False
+    install_fake_langfuse(monkeypatch, client)
+    tracer = LangfuseTracer()
+
+    span = tracer.start("agent.chat", session_id="s-1")
+
+    assert span.trace_id != client.trace_id
+    assert len(span.trace_id) == 32 and len(span.span_id) == 32
+    span.end()
