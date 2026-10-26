@@ -51,6 +51,12 @@ class AgentTool(Tool):
             # the sub-agent answers to the same consent layer and hooks as the parent
             permission=parent.permission,
             hooks=parent.hooks,
+            # and it is traced as part of this run: left unset, Agent.__init__ would
+            # re-read CORECODER_TRACE here and hang a second tree onto whichever
+            # backend the environment happened to name, under a session id the
+            # caller never asked for
+            tracer=parent.tracer,
+            session_id=parent.session_id,
         )
 
         # a sub-agent failure comes back as text, never propagates into the parent

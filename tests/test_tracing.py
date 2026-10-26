@@ -737,3 +737,37 @@ def test_the_fallback_answer_is_recorded_too(tmp_path):
     root = next(r for r in rows(path) if r["name"] == "agent.chat")
     assert root["attrs"]["output"] == "(reached maximum tool-call rounds)"
     assert root["attrs"]["outcome"] == "max_rounds"
+
+
+def test_sub_agent_traces_into_the_parents_tree(tmp_path):
+    """A sub-agent inherits the parent's tracer and session, not a new pair (B5).
+
+    It used to build its own by re-reading CORECODER_TRACE here, so a caller
+    that handed the parent a JSONL tracer still got a second tree uploaded to
+    whichever backend its environment happened to name.
+    """
+    from corecoder.tools.agent import AgentTool
+
+    path = tmp_path / "trace.jsonl"
+    llm = scripted(
+        LLMResponse(content="", tool_calls=[
+            ToolCall(id="a1", name="agent", arguments={"task": "subtask"})]),
+        LLMResponse(content="sub done"),   # the sub-agent's one and only round
+        LLMResponse(content="parent done"),
+    )
+    agent = Agent(llm=llm, tools=[AgentTool()], session_id="parent-s",
+                  permission=Permission(allow_all=True),
+                  tracer=JsonlTracer(path, capture_content=True))
+
+    assert agent.chat("go") == "parent done"
+
+    records = rows(path)
+    chats = [r for r in records if r["name"] == "agent.chat"]
+    tools = [r for r in records if r["type"] == "tool"]
+    assert [r["name"] for r in tools] == ["tool.agent"]
+    assert len(chats) == 2
+    root = next(r for r in chats if r["parent_id"] is None)
+    child = next(r for r in chats if r["parent_id"] is not None)
+    assert child["parent_id"] == tools[0]["span_id"]
+    assert {r["trace_id"] for r in records} == {root["trace_id"]}
+    assert {r["session_id"] for r in records} == {"parent-s"}
