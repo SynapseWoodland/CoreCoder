@@ -13,6 +13,7 @@ Group 12 pins M4: every tool result is clamped and redacted before it enters
 the history, and read_file refuses oversized files.
 """
 
+import json
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
@@ -21,12 +22,13 @@ import pytest
 from openai import BadRequestError
 
 from corecoder.agent import Agent, TruncatedOutput
-from corecoder.context import ContextManager
+from corecoder.context import ContextManager, estimate_tokens
 from corecoder.demo import ScriptedLLM
 from corecoder.llm import LLM, LLMResponse, ToolCall
 from corecoder.permissions import Permission
 from corecoder.tools.base import Tool
 from corecoder.tools.write import WriteFileTool
+from corecoder.tracing import JsonlTracer
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -681,6 +683,71 @@ class TestContextOverflowRecovery:
 
         assert compress.call_count == 1
         assert compress.call_args.kwargs["fixed_tokens"] > 0
+
+    def test_estimated_prompt_counts_fixed_overhead_once(self, tmp_path):
+        """`estimated_prompt` must be the history plus the fixed overhead once.
+
+        `_full_messages()` already carries the system message and the fixed
+        overhead counts it again, so adding both reported the system prompt
+        twice (M + 2F + T instead of M + F + T) - and that inflated number was
+        what got compared against the provider's prompt_tokens.
+        """
+        trace_path = tmp_path / "llm-rounds.jsonl"
+        llm = ScriptedLLM([LLMResponse(content="ok")])
+        agent = Agent(llm=llm, tools=[SpyTool()], tracer=JsonlTracer(trace_path))
+
+        # the estimate is taken before the reply joins the history, so pin
+        # what the round actually saw, not the post-chat list
+        seen: list[tuple[list[dict], list[dict]]] = []
+        original_chat = llm.chat
+
+        def recording_chat(messages, tools=None, on_token=None, on_reasoning=None):
+            seen.append((list(agent.messages), agent._full_messages()))
+            return original_chat(messages, tools=tools, on_token=on_token,
+                                 on_reasoning=on_reasoning)
+
+        llm.chat = recording_chat
+        assert agent.chat("hi") == "ok"
+
+        records = [json.loads(line) for line in
+                   trace_path.read_text(encoding="utf-8").splitlines()]
+        [round_span] = [r for r in records if r["name"] == "llm.round"]
+        estimated = round_span["attrs"]["estimated_prompt"]
+        agent.tracer.close()
+
+        history, full = seen[0]
+        fixed = agent._fixed_prompt_tokens()
+        assert estimated == estimate_tokens(history) + fixed
+
+        # the shape this test forbids: `full` already holds the system message,
+        # so the old formula overshot by exactly one system prompt
+        double_counted = estimate_tokens(full) + fixed
+        assert double_counted != estimated
+        system_only = [{"role": "system", "content": full[0]["content"]}]
+        assert double_counted - estimated == estimate_tokens(system_only)
+
+    def test_fixed_overhead_ignores_history(self):
+        """A growing history must never move the fixed part.
+
+        `fixed_tokens` is added on top of the history by `maybe_compress`; if
+        the helper ever absorbed history tokens, every request would be counted
+        twice and compression would fire early.
+        """
+        agent = Agent(llm=ScriptedLLM([LLMResponse(content="ok")]), tools=[SpyTool()])
+        before = agent._fixed_prompt_tokens()
+        agent.messages.extend(
+            {"role": "user", "content": "x" * 4000} for _ in range(3))
+
+        assert agent._fixed_prompt_tokens() == before
+
+        with mock.patch.object(agent.context, "maybe_compress",
+                               return_value=False) as compress:
+            assert agent.chat("hi") == "ok"
+
+        # the term handed to compression is the fixed part alone, never the
+        # history it is added to
+        assert compress.call_count == 1
+        assert compress.call_args.kwargs["fixed_tokens"] == before
 
 
 # ─── 12. M4: tool results are clamped and redacted before history ───────────

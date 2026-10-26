@@ -147,8 +147,12 @@ class Agent:
             for round_idx in range(self.max_rounds):
                 current_round = round_idx + 1
                 rounds = current_round
+                # history + system + tool schemas, the same composition the
+                # compression calls and the 400 fallback use; _full_messages()
+                # already carries the system message, so adding the fixed
+                # overhead to it would count that prompt twice
                 estimated_prompt = (
-                    estimate_tokens(self._full_messages()) + self._fixed_prompt_tokens())
+                    estimate_tokens(self.messages) + self._fixed_prompt_tokens())
                 call_started = time.perf_counter()
                 call_cost_before = self._estimated_cost()
                 retried = False
