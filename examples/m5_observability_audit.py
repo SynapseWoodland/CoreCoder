@@ -61,8 +61,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rich.console import Console
 from rich.panel import Panel
 
+from corecoder import audit
 from corecoder import llm as llm_module
-from corecoder import observability
 from corecoder.agent import Agent
 from corecoder.config import Config
 from corecoder.llm import LLM, LiteLLM, LLMResponse, ToolCall
@@ -268,9 +268,9 @@ def reset(path: Path) -> None:
     # drill/degrade modes never touch the switch, so enable it here too
     os.environ["CORECODER_AUDIT"] = "1"
     os.environ["CORECODER_AUDIT_FILE"] = str(path)
-    observability.reset_audit()
+    audit.reset_audit()
     path.write_text("", encoding="utf-8")
-    observability.configure_audit(file=path)
+    audit.configure_audit(file=path)
 
 
 def history_valid(messages: list[dict]) -> bool:
@@ -400,7 +400,7 @@ def phase_bad_arguments(llm, path: Path) -> dict:
     }
 
 
-def phase_trace_public(llm, audit: Path, trace_path: Path) -> dict:
+def phase_trace_public(llm, audit_path: Path, trace_path: Path) -> dict:
     """One clamped/redacted result and one rejected call in the same round."""
     bulk = BulkTool()
     calls = [
@@ -414,7 +414,7 @@ def phase_trace_public(llm, audit: Path, trace_path: Path) -> dict:
         permission=Permission(allow_all=True), max_rounds=6,
         tracer=JsonlTracer(trace_path, capture_content=True),
     )
-    reset(audit)
+    reset(audit_path)
     reply = agent.chat("Call the tools, then reply with the single word DONE.")
 
     records = trace_rows(trace_path)
@@ -436,7 +436,7 @@ def phase_trace_public(llm, audit: Path, trace_path: Path) -> dict:
 
 
 def drill_report(workdir: Path, llm) -> dict:
-    audit = workdir / "drill_audit.log"
+    audit_path = workdir / "drill_audit.log"
     trace = workdir / "drill_trace.jsonl"
     slow = SlowTool()
     calls = [
@@ -449,10 +449,10 @@ def drill_report(workdir: Path, llm) -> dict:
         permission=Permission(allow_all=True), max_rounds=6,
         tracer=JsonlTracer(trace),
     )
-    reset(audit)
+    reset(audit_path)
     agent.chat("Follow the injected calls, then reply with the single word DONE.")
 
-    summary = lines(audit, "run_summary")
+    summary = lines(audit_path, "run_summary")
     summary_fields = fields(summary[-1]) if summary else {}
     spans = [r for r in trace_rows(trace) if r["type"] == "tool"]
     report = []
@@ -554,15 +554,15 @@ def phase_bench(workdir: Path) -> list[dict]:
              ("audit+jsonl", True, True))
     for name, audit_on, trace_on in tiers:
         stem = name.replace("+", "_")
-        audit = workdir / f"bench_{stem}.audit.log"
+        audit_path = workdir / f"bench_{stem}.audit.log"
         trace = workdir / f"bench_{stem}.jsonl"
         os.environ["CORECODER_AUDIT"] = "1" if audit_on else "0"
-        os.environ["CORECODER_AUDIT_FILE"] = str(audit)
+        os.environ["CORECODER_AUDIT_FILE"] = str(audit_path)
         os.environ["CORECODER_TRACE"] = "jsonl" if trace_on else "off"
         os.environ["CORECODER_TRACE_FILE"] = str(trace)
-        observability.reset_audit()
+        audit.reset_audit()
         if audit_on:
-            observability.configure_audit(file=audit)
+            audit.configure_audit(file=audit_path)
 
         agent = Agent(llm=BenchLLM(), tools=[EchoTool()],
                       permission=Permission(allow_all=True), max_rounds=4)
@@ -570,10 +570,10 @@ def phase_bench(workdir: Path) -> list[dict]:
         for _ in range(20):
             agent.chat("go")
         elapsed = time.perf_counter() - started
-        observability.reset_audit()
+        audit.reset_audit()
         results.append({"name": name, "total_s": elapsed,
                         "per_chat_ms": elapsed / 20 * 1000,
-                        "audit_bytes": audit.stat().st_size if audit.exists() else 0,
+                        "audit_bytes": audit_path.stat().st_size if audit_path.exists() else 0,
                         "trace_bytes": trace.stat().st_size if trace.exists() else 0})
     return results
 
@@ -702,10 +702,10 @@ def main() -> int:
     if args.degrade:
         return run_degrade(llm, workdir)
 
-    audit = workdir / "audit.log"
+    audit_path = workdir / "audit.log"
     # only the audit switch: no CORECODER_LOG_LEVEL, no stream opt-in
     os.environ["CORECODER_AUDIT"] = "1"
-    os.environ["CORECODER_AUDIT_FILE"] = str(audit)
+    os.environ["CORECODER_AUDIT_FILE"] = str(audit_path)
 
     tracer = None
     trace_path = None
@@ -725,14 +725,14 @@ def main() -> int:
         f"model: {cfg.model}\nbase: {cfg.base_url or 'default'}\n"
         f"pricing: {'none (cost must be None)' if args.inject_no_pricing else 'temp $1/$2 per Mtok'}\n"
         f"trace: {args.backend}\n"
-        f"audit: {audit}",
+        f"audit: {audit_path}",
         title="M5 - audit and trace against a real provider",
     ))
 
     checks: list[tuple[str, bool, str]] = []
 
     section("phase 1 - real tool call, audit + trace events")
-    events = phase_events(llm, audit, trace_path, tracer)
+    events = phase_events(llm, audit_path, trace_path, tracer)
     console.print(f"tool calls: {events.get('tool_calls')}  "
                   f"history valid: {events.get('valid')}")
     if not events.get("called"):
@@ -806,7 +806,7 @@ def main() -> int:
 
     if args.inject_backfill:
         section("phase 2 - injected on_tool failure")
-        backfill = phase_backfill(llm, audit)
+        backfill = phase_backfill(llm, audit_path)
         console.print(f"raised: {backfill['raised']}  backfill count: {backfill['count']}  "
                       f"history valid: {backfill['valid']}")
         checks.append(("KeyboardInterrupt-style escape surfaced", backfill["raised"],
@@ -818,7 +818,7 @@ def main() -> int:
 
     if args.inject_bad_args:
         section("phase 3 - injected unparseable arguments")
-        bad = phase_bad_arguments(llm, audit)
+        bad = phase_bad_arguments(llm, audit_path)
         console.print(f"decision: {bad['decision']}  effective: {bad['effective']}  "
                       f"outcome: {bad['outcome']}  tool calls: {bad['tool_calls']}")
         checks.append(("decision=bad_arguments", bad["decision"] == "bad_arguments",
@@ -831,7 +831,7 @@ def main() -> int:
 
     if trace_path is not None:
         section("phase 4 - oversized + secret result, and a rejected call")
-        public = phase_trace_public(llm, audit, workdir / "trace_public.jsonl")
+        public = phase_trace_public(llm, audit_path, workdir / "trace_public.jsonl")
         console.print(f"reply: {public['reply'][:60]!r}")
         console.print(f"bulk: effective={public['bulk_effective']} "
                       f"outcome={public['bulk_outcome']} "
@@ -860,7 +860,7 @@ def main() -> int:
     console.print("")
     if not ok:
         console.print("[red]FAIL[/red] one or more audit/trace checks did not hold.")
-        console.print(f"audit log kept at: {audit}")
+        console.print(f"audit log kept at: {audit_path}")
         if trace_path is not None:
             console.print(f"trace kept at: {trace_path}")
         console.print(f'cleanup: rm -rf "{workdir}"')
@@ -868,7 +868,7 @@ def main() -> int:
 
     console.print("[green]PASS[/green] every enabled audit/trace check held "
                   "against the real provider.")
-    console.print(f"audit log kept at: {audit}")
+    console.print(f"audit log kept at: {audit_path}")
     if trace_path is not None:
         console.print(f"trace kept at: {trace_path}")
     console.print(f'cleanup: rm -rf "{workdir}"')

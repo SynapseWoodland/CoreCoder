@@ -2,8 +2,8 @@
 
 Tracing is off by default and never changes agent behaviour: every backend is
 wrapped by :class:`SafeTracer`, which turns a broken sink into a one-time
-warning. Audit logging is separate (see ``observability.py``): audit is
-metadata-only and cheap, tracing is a span tree meant for a viewer. The two
+warning. Audit logging is separate (see ``audit.py``): audit is metadata-only
+and cheap, tracing is a span tree meant for a viewer. The two
 meet through ``current_trace_context``: audit lines carry the ids of the span
 that was open, so a line and its trace record can be joined.
 
@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .observability import prune_old_logs, truthy
+from .audit import prune_old_logs, truthy
 
 _general = logging.getLogger("corecoder")
 

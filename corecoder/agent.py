@@ -18,9 +18,9 @@ import re
 import time
 from dataclasses import dataclass
 
+from .audit import log_event
 from .context import ContextManager, estimate_tokens
 from .llm import LLM, is_context_length_error
-from .observability import log_event
 from .permissions import Permission
 from .prompt import PLAN_MODE_PROMPT, system_prompt
 from .session import new_session_id

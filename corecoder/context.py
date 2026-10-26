@@ -18,7 +18,7 @@ import math
 import re
 from typing import TYPE_CHECKING
 
-from .observability import log_event
+from .audit import log_event
 
 if TYPE_CHECKING:
     from .llm import LLM

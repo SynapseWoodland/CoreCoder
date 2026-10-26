@@ -13,11 +13,11 @@ from rich.panel import Panel
 
 from . import __version__
 from .agent import Agent, TruncatedOutput
+from .audit import configure_logging
 from .config import Config
 from .hooks import load_hooks
 from .llm import LLM, LiteLLM
 from .mcp import load_mcp_tools
-from .observability import configure_logging
 from .permissions import DEFAULT_STORE, Permission
 from .session import list_sessions, load_session_record, save_session
 from .tools import ALL_TOOLS

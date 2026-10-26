@@ -8,7 +8,7 @@ string, a dangling brace). The refusal must stay compact for the model.
 from types import SimpleNamespace
 from typing import ClassVar
 
-from corecoder import observability
+from corecoder import audit
 from corecoder.agent import Agent
 from corecoder.demo import ScriptedLLM
 from corecoder.llm import LLMResponse, ToolCall
@@ -115,11 +115,11 @@ def test_chat_refuses_with_diagnostics_and_keeps_history_valid():
 def test_raw_arguments_never_reach_audit_or_trace(tmp_path):
     secret = "sk-abcdefghijklmnop1234"
     raw = '{"text": "' + secret + " " + "A" * 300 + ' TAILMARK"}'
-    audit = tmp_path / "audit.log"
+    audit_path = tmp_path / "audit.log"
     trace_file = tmp_path / "trace.jsonl"
     tracer = JsonlTracer(trace_file, capture_content=True)
 
-    observability.configure_audit(file=audit, level="INFO")
+    audit.configure_audit(file=audit_path, level="INFO")
     try:
         import os
         old = os.environ.get("CORECODER_AUDIT")
@@ -133,12 +133,12 @@ def test_raw_arguments_never_reach_audit_or_trace(tmp_path):
             else:
                 os.environ["CORECODER_AUDIT"] = old
     finally:
-        observability.reset_audit()
+        audit.reset_audit()
 
     assert secret in tool_reply(agent)  # the model needs to see what it sent
     assert tool.calls == []
 
-    audit_text = audit.read_text(encoding="utf-8")
+    audit_text = audit_path.read_text(encoding="utf-8")
     assert "tool_result" in audit_text
     assert secret not in audit_text
     assert "TAILMARK" not in audit_text

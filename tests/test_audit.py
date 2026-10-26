@@ -19,7 +19,7 @@ from unittest import mock
 import pytest
 from openai import APIConnectionError, BadRequestError
 
-from corecoder import observability
+from corecoder import audit
 from corecoder import session as session_module
 from corecoder.agent import Agent, TruncatedOutput
 from corecoder.context import ContextManager
@@ -38,9 +38,9 @@ def audit_env(monkeypatch, tmp_path):
     monkeypatch.setenv("CORECODER_AUDIT_FILE", str(tmp_path / "audit.log"))
     monkeypatch.delenv("CORECODER_AUDIT_STREAM", raising=False)
     monkeypatch.delenv("CORECODER_AUDIT_MAX_MB", raising=False)
-    observability.reset_audit()
+    audit.reset_audit()
     yield tmp_path
-    observability.reset_audit()
+    audit.reset_audit()
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -103,7 +103,7 @@ def _agent(tools, turns, **kwargs):
 
 def _capture():
     stream = io.StringIO()
-    observability.configure_audit(stream=stream)
+    audit.configure_audit(stream=stream)
     return stream
 
 
@@ -179,7 +179,7 @@ def test_audit_events_require_only_the_audit_switch(monkeypatch):
 
     before = out.getvalue()
     monkeypatch.setenv("CORECODER_AUDIT", "0")
-    observability.log_event("probe")
+    audit.log_event("probe")
     assert out.getvalue() == before
 
 
@@ -503,10 +503,10 @@ def test_litellm_retry_is_logged(monkeypatch):
 
 def test_configure_audit_is_idempotent_and_falls_back_to_info():
     stream = io.StringIO()
-    observability.configure_audit(stream=stream, level="LOUD")
-    observability.configure_audit(stream=stream)
+    audit.configure_audit(stream=stream, level="LOUD")
+    audit.configure_audit(stream=stream)
 
-    handlers = [h for h in observability.audit_logger.handlers if getattr(h, "_cc_audit", False)]
+    handlers = [h for h in audit.audit_logger.handlers if getattr(h, "_cc_audit", False)]
     assert len(handlers) == 1
     assert handlers[0].level == logging.INFO
 
@@ -517,14 +517,14 @@ def test_audit_stream_must_be_explicitly_opted_in(monkeypatch):
     monkeypatch.setattr(sys, "stderr", buf)
     monkeypatch.setenv("CORECODER_AUDIT_STREAM", "stderr")
 
-    observability.configure_audit()
-    observability.log_event("probe")
+    audit.configure_audit()
+    audit.log_event("probe")
 
     assert "event=probe" in buf.getvalue()
 
 
 def test_default_file_name_is_per_process():
-    path = observability._default_audit_path()
+    path = audit._default_audit_path()
     assert path.name == f"audit.{os.getpid()}.log"
     assert path.parent.name == ".corecoder"
 
@@ -535,10 +535,10 @@ def test_unwritable_target_warns_once_and_never_raises(monkeypatch, tmp_path, ca
     monkeypatch.setenv("CORECODER_AUDIT_FILE", str(blocker / "audit.log"))
 
     with caplog.at_level(logging.WARNING, logger="corecoder"):
-        observability.configure_audit()
+        audit.configure_audit()
 
     assert "event=audit_disabled" in caplog.text
-    observability.log_event("probe")  # no handler, no raise
+    audit.log_event("probe")  # no handler, no raise
 
 
 def test_oversized_log_rotates_at_startup(monkeypatch, tmp_path):
@@ -547,7 +547,7 @@ def test_oversized_log_rotates_at_startup(monkeypatch, tmp_path):
     monkeypatch.setenv("CORECODER_AUDIT_FILE", str(target))
     monkeypatch.setenv("CORECODER_AUDIT_MAX_MB", "1")
 
-    observability.configure_audit()
+    audit.configure_audit()
 
     assert (tmp_path / "audit.log.1").exists()
     assert target.stat().st_size < 1024 * 1024
@@ -555,9 +555,9 @@ def test_oversized_log_rotates_at_startup(monkeypatch, tmp_path):
 
 def test_one_os_write_per_line(monkeypatch, tmp_path):
     target = tmp_path / "audit.log"
-    observability.configure_audit(file=target)
-    with mock.patch("corecoder.observability.os.write", return_value=1) as write:
-        observability.log_event("probe", tool="spy")
+    audit.configure_audit(file=target)
+    with mock.patch("corecoder.audit.os.write", return_value=1) as write:
+        audit.log_event("probe", tool="spy")
 
     assert write.call_count == 1
     payload = write.call_args[0][1]
@@ -566,14 +566,14 @@ def test_one_os_write_per_line(monkeypatch, tmp_path):
 
 def test_default_logs_are_pruned_to_ten_but_explicit_paths_are_kept(monkeypatch, tmp_path):
     target = tmp_path / f"audit.{os.getpid()}.log"
-    monkeypatch.setattr(observability, "_default_audit_path", lambda: target)
+    monkeypatch.setattr(audit, "_default_audit_path", lambda: target)
     monkeypatch.delenv("CORECODER_AUDIT_FILE")
     for i in range(12):
         path = tmp_path / f"audit.{1000 + i}.log"
         path.write_text("x", encoding="utf-8")
         os.utime(path, (1000 + i, 1000 + i))
 
-    observability.configure_audit()
+    audit.configure_audit()
 
     remaining = list(tmp_path.glob("audit.*.log"))
     assert len(remaining) == 10
@@ -583,7 +583,7 @@ def test_default_logs_are_pruned_to_ten_but_explicit_paths_are_kept(monkeypatch,
     explicit_dir.mkdir()
     for i in range(12):
         (explicit_dir / f"audit.{2000 + i}.log").write_text("x", encoding="utf-8")
-    observability.configure_audit(file=explicit_dir / "audit.other.log")
+    audit.configure_audit(file=explicit_dir / "audit.other.log")
     assert len(list(explicit_dir.glob("audit.*.log"))) == 13
 
 
@@ -605,11 +605,11 @@ class _BrokenStream:
 
 def test_runtime_write_failures_warn_once_then_disable(caplog):
     stream = _BrokenStream()
-    observability.configure_audit(stream=stream)
+    audit.configure_audit(stream=stream)
 
     with caplog.at_level(logging.WARNING, logger="corecoder"):
         for i in range(5):
-            observability.log_event(f"probe{i}")
+            audit.log_event(f"probe{i}")
 
     warnings = [r for r in caplog.records if "audit_write_failed" in r.getMessage()]
     assert len(warnings) == 1
@@ -618,38 +618,48 @@ def test_runtime_write_failures_warn_once_then_disable(caplog):
 
 def test_a_successful_write_resets_the_failure_streak(caplog):
     stream = _BrokenStream(fail_times=1)
-    observability.configure_audit(stream=stream)
+    audit.configure_audit(stream=stream)
 
     with caplog.at_level(logging.WARNING, logger="corecoder"):
         for i in range(5):
-            observability.log_event(f"probe{i}")
+            audit.log_event(f"probe{i}")
 
     assert stream.writes == 5
     assert len([r for r in caplog.records if "audit_write_failed" in r.getMessage()]) == 1
 
 
-def test_log_event_never_raises_even_when_the_formatter_does():
-    observability.configure_audit(stream=io.StringIO())
+def _sink_with_exploding_formatter():
+    """Put a raising formatter on the audit sink and return how to undo it.
+
+    Only the sink this module installed: pytest attaches its own capture
+    handlers to every logger that does not propagate, so
+    ``audit.audit_logger.handlers`` also holds objects that later tests still
+    need in working order.
+    """
+    sink = next(h for h in audit.audit_logger.handlers if getattr(h, "_cc_audit", False))
 
     class Exploding(logging.Formatter):
         def format(self, record):
             raise RuntimeError("format boom")
 
-    for handler in observability.audit_logger.handlers:
-        handler.setFormatter(Exploding())
+    original = sink.formatter
+    sink.setFormatter(Exploding())
+    return sink, original
 
-    observability.log_event("probe")
+
+def test_log_event_never_raises_even_when_the_formatter_does():
+    audit.configure_audit(stream=io.StringIO())
+    sink, original = _sink_with_exploding_formatter()
+
+    try:
+        audit.log_event("probe")
+    finally:
+        sink.setFormatter(original)
 
 
 def test_a_crashing_audit_backend_does_not_replace_keyboardinterrupt():
-    observability.configure_audit(stream=io.StringIO())
-
-    class Exploding(logging.Formatter):
-        def format(self, record):
-            raise RuntimeError("format boom")
-
-    for handler in observability.audit_logger.handlers:
-        handler.setFormatter(Exploding())
+    audit.configure_audit(stream=io.StringIO())
+    sink, original = _sink_with_exploding_formatter()
 
     class Killer(SpyTool):
         def execute(self):
@@ -659,10 +669,13 @@ def test_a_crashing_audit_backend_does_not_replace_keyboardinterrupt():
     killer.name = "killer"
     agent = _agent([killer], [_turn(_tc("killer", "c1"))])
 
-    with pytest.raises(KeyboardInterrupt):
-        agent.chat("go")
-    replied = {m["tool_call_id"] for m in agent.messages if m.get("role") == "tool"}
-    assert replied == {"c1"}
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            agent.chat("go")
+        replied = {m["tool_call_id"] for m in agent.messages if m.get("role") == "tool"}
+        assert replied == {"c1"}
+    finally:
+        sink.setFormatter(original)
 
 
 def test_audit_never_records_prompts_arguments_or_results():

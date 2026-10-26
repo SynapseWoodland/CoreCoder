@@ -54,10 +54,10 @@ from rich.markup import escape
 from rich.panel import Panel
 
 from corecoder.agent import Agent
+from corecoder.audit import configure_audit
 from corecoder.config import Config
 from corecoder.demo import ScriptedLLM
 from corecoder.llm import LLM, LiteLLM, LLMResponse, ToolCall
-from corecoder.observability import configure_audit
 from corecoder.permissions import Permission
 from corecoder.tools.base import Tool
 

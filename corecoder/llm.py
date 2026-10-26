@@ -16,7 +16,7 @@ from pathlib import Path
 
 from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, OpenAI, RateLimitError
 
-from .observability import log_event
+from .audit import log_event
 
 
 @dataclass
