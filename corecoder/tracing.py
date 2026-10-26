@@ -6,6 +6,11 @@ warning. Audit logging is separate (see ``observability.py``): audit is
 metadata-only and cheap, tracing is a span tree meant for a viewer. The two
 meet through ``current_trace_context``: audit lines carry the ids of the span
 that was open, so a line and its trace record can be joined.
+
+Agent code never touches a span: it records business facts through
+:class:`RunTrace` (one chat run, its model rounds, its tool calls) and this
+module decides what those facts mean for a span. The span protocol below is
+the backends' side of that contract.
 """
 
 import atexit
@@ -15,36 +20,73 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
-from .observability import prune_old_logs
+from .observability import prune_old_logs, truthy
 
 _general = logging.getLogger("corecoder")
 
-
-# The spans open on this thread, across every tracer instance. The audit log
-# asks for the innermost one so a line can name the span it belongs to; that is
-# the only link between the two streams, and it lives here because the tracers
-# own the span ids. Per-thread, like the tracers' own stacks: a parallel worker
-# starts no span, so it reports none.
-_context = threading.local()
+_DEFAULT_MAX_BYTES = 100 * 1024 * 1024
+# backends that mean "no tracing at all"
+_OFF_BACKENDS = ("", "off", "none", "0")
+# attributes dropped from every span unless content capture was asked for
+_CONTENT_KEYS = ("input", "output")
 
 
-def _push_context(span) -> None:
-    stack = getattr(_context, "stack", None)
-    if stack is None:
-        stack = _context.stack = []
-    stack.append(span)
+class _Once:
+    """A thread-safe latch for a warning that must fire at most once."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._done = False
+
+    def claim(self) -> bool:
+        """True for the first caller only."""
+        with self._lock:
+            if self._done:
+                return False
+            self._done = True
+            return True
 
 
-def _pop_context(span) -> None:
-    stack = getattr(_context, "stack", None)
-    if not stack:
-        return
-    if stack[-1] is span:
-        stack.pop()
-    elif span in stack:
-        stack.remove(span)
+class _SpanStack:
+    """The spans open on one thread, innermost last.
+
+    Every tracer owns one, and so does this module: the audit log asks the
+    module-wide stack (``_context``) for the innermost span, which is the only
+    link between the two streams. Per-thread by construction, because a
+    parallel worker starts no span and must therefore report none.
+    """
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _stack(self) -> list:
+        stack = getattr(self._local, "stack", None)
+        if stack is None:
+            stack = self._local.stack = []
+        return stack
+
+    def push(self, span) -> None:
+        self._stack().append(span)
+
+    def pop(self, span) -> None:
+        """Remove ``span``, tolerating an out-of-order close."""
+        stack = self._stack()
+        if stack and stack[-1] is span:
+            stack.pop()
+        elif span in stack:
+            stack.remove(span)
+
+    def top(self):
+        """The innermost open span, or None."""
+        stack = self._stack()
+        return stack[-1] if stack else None
+
+
+_context = _SpanStack()
 
 
 def current_trace_context() -> dict[str, str] | None:
@@ -53,10 +95,9 @@ def current_trace_context() -> dict[str, str] | None:
     ``None`` when tracing is off: a NullTracer produces no spans, so there is
     nothing to join, and invented ids would make a broken join look fine.
     """
-    stack = getattr(_context, "stack", None)
-    if not stack:
+    span = _context.top()
+    if span is None:
         return None
-    span = stack[-1]
     return {"trace_id": span.trace_id, "span_id": span.span_id}
 
 
@@ -104,6 +145,8 @@ class NullSpan(Span):
 
 
 class NullTracer:
+    """The tracer used whenever tracing is off or cannot start."""
+
     capture_content = False
 
     def start(self, name: str, as_type: str = "span", **attrs) -> NullSpan:
@@ -113,24 +156,69 @@ class NullTracer:
         pass
 
 
+@dataclass
+class _Origin:
+    """Where a new span belongs: its parent, ids and inherited session."""
+
+    parent: object | None
+    trace_id: str
+    session_id: str
+    round_idx: int | None
+
+
+class _SpanTracer:
+    """Span bookkeeping the backends share: thread stack, content filter, ids."""
+
+    def __init__(self, capture_content: bool = False) -> None:
+        self.capture_content = capture_content
+        self._spans = _SpanStack()
+
+    def _filter(self, attrs: dict) -> dict:
+        """Drop captured prompts and results unless the user opted in."""
+        if self.capture_content:
+            return attrs
+        return {k: v for k, v in attrs.items() if k not in _CONTENT_KEYS}
+
+    def _origin(self, attrs: dict) -> _Origin:
+        """Resolve the parent, trace id, session and round of a new span.
+
+        ``session_id`` and ``round`` travel as start attributes but belong to
+        the span record rather than to the span's own attributes, so they are
+        popped here.
+        """
+        parent = self._spans.top()
+        session_id = attrs.pop("session_id", None)
+        if session_id is None:
+            session_id = parent.session_id if parent is not None else ""
+        round_idx = attrs.pop("round", None)
+        trace_id = parent.trace_id if parent is not None else uuid.uuid4().hex
+        return _Origin(parent, trace_id, session_id, round_idx)
+
+    def _pop(self, span) -> None:
+        self._spans.pop(span)
+
+    def flush(self) -> None:
+        pass
+
+
 class _BaseSpan(Span):
-    def __init__(self, tracer, name, as_type, parent, trace_id, session_id, round_idx):
+    def __init__(self, tracer, name, as_type, origin: _Origin):
         self.tracer = tracer
         self.name = name
         self.type = as_type
-        self.parent = parent
-        self.parent_id = parent.span_id if parent is not None else None
-        self.trace_id = trace_id
+        self.parent = origin.parent
+        self.parent_id = origin.parent.span_id if origin.parent is not None else None
+        self.trace_id = origin.trace_id
         self.span_id = uuid.uuid4().hex
-        self.session_id = session_id
-        self.round = round_idx
+        self.session_id = origin.session_id
+        self.round = origin.round_idx
         self.attrs: dict = {}
         self.events: list[dict] = []
         self.error: str | None = None
         self.start = time.time()
         self.end_time: float | None = None
         self._ended = False
-        _push_context(self)
+        _context.push(self)
 
     def update(self, **attrs) -> None:
         self.attrs.update(self.tracer._filter(attrs))
@@ -164,7 +252,7 @@ class _BaseSpan(Span):
             self._close()
         finally:
             self.tracer._pop(self)
-            _pop_context(self)
+            _context.pop(self)
 
     def _close(self) -> None:
         raise NotImplementedError
@@ -191,10 +279,12 @@ class _JsonlSpan(_BaseSpan):
         self.tracer._write(record)
 
 
-class JsonlTracer:
+class JsonlTracer(_SpanTracer):
+    """One JSON line per finished span: append-only, joinable by id."""
+
     def __init__(self, path, capture_content: bool = False,
-                 max_bytes: int = 100 * 1024 * 1024, prune: bool = False):
-        self.capture_content = capture_content
+                 max_bytes: int = _DEFAULT_MAX_BYTES, prune: bool = False):
+        super().__init__(capture_content)
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists() and self.path.stat().st_size > max_bytes:
@@ -204,37 +294,11 @@ class JsonlTracer:
             # prune after opening so the current pid file exists and is kept
             prune_old_logs(self.path.parent / "traces.*.jsonl", keep=10, skip=self.path)
         self._lock = threading.Lock()
-        self._local = threading.local()
-
-    def _filter(self, attrs: dict) -> dict:
-        if self.capture_content:
-            return attrs
-        return {k: v for k, v in attrs.items() if k not in ("input", "output")}
-
-    def _stack(self) -> list:
-        stack = getattr(self._local, "stack", None)
-        if stack is None:
-            stack = self._local.stack = []
-        return stack
-
-    def _pop(self, span) -> None:
-        stack = self._stack()
-        if stack and stack[-1] is span:
-            stack.pop()
-        elif span in stack:
-            stack.remove(span)
 
     def start(self, name: str, as_type: str = "span", **attrs) -> _JsonlSpan:
-        stack = self._stack()
-        parent = stack[-1] if stack else None
-        session_id = attrs.pop("session_id", None)
-        if session_id is None:
-            session_id = parent.session_id if parent is not None else ""
-        round_idx = attrs.pop("round", None)
-        trace_id = parent.trace_id if parent is not None else uuid.uuid4().hex
-        span = _JsonlSpan(self, name, as_type, parent, trace_id, session_id, round_idx)
+        span = _JsonlSpan(self, name, as_type, self._origin(attrs))
         span.update(**attrs)
-        stack.append(span)
+        self._spans.push(span)
         return span
 
     def _write(self, record: dict) -> None:
@@ -242,9 +306,6 @@ class JsonlTracer:
             "utf-8", "replace")
         with self._lock:
             _os_write(self._fd, data)
-
-    def flush(self) -> None:
-        pass
 
     def close(self) -> None:
         try:
@@ -273,9 +334,16 @@ def _native_usage(attrs: dict) -> dict | None:
     return details or None
 
 
+def _exit_quietly(context) -> None:
+    """Leave an optional OTEL context manager, when one was entered."""
+    if context is not None:
+        context.__exit__(None, None, None)
+
+
 class _LangfuseSpan(_BaseSpan):
-    def __init__(self, tracer, observation, context, *args, propagator=None):
-        super().__init__(tracer, *args)
+    def __init__(self, tracer, observation, context, name, as_type, origin,
+                 propagator=None):
+        super().__init__(tracer, name, as_type, origin)
         self.observation = observation
         self.context = context
         self.propagator = propagator
@@ -313,13 +381,26 @@ class _LangfuseSpan(_BaseSpan):
         self.context.__exit__(None, None, None)
         # the attribute context was opened before the observation, so it must
         # be closed after it: OTEL contexts unhook in reverse order
-        if self.propagator is not None:
-            self.propagator.__exit__(None, None, None)
+        _exit_quietly(self.propagator)
 
 
-class LangfuseTracer:
+def _trace_attributes(session_id: str, user_id, tags) -> dict:
+    """The trace-level attributes that were actually supplied."""
+    attrs: dict = {}
+    if session_id:
+        attrs["session_id"] = session_id
+    if user_id:
+        attrs["user_id"] = user_id
+    if tags:
+        attrs["tags"] = tags
+    return attrs
+
+
+class LangfuseTracer(_SpanTracer):
+    """Spans backed by the Langfuse SDK's observation contexts."""
+
     def __init__(self, capture_content: bool = False, client=None):
-        self.capture_content = capture_content
+        super().__init__(capture_content)
         if client is None:
             if not (os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")):
                 raise TracingUnavailable(
@@ -331,25 +412,26 @@ class LangfuseTracer:
             client = get_client()
             atexit.register(self.flush)
         self.client = client
-        self._local = threading.local()
 
-    def _filter(self, attrs: dict) -> dict:
-        if self.capture_content:
-            return attrs
-        return {k: v for k, v in attrs.items() if k not in ("input", "output")}
+    def _open_trace_attributes(self, origin: _Origin, attrs: dict):
+        """Enter the trace-level attribute context, on the root span only.
 
-    def _stack(self) -> list:
-        stack = getattr(self._local, "stack", None)
-        if stack is None:
-            stack = self._local.stack = []
-        return stack
+        ``user_id`` and ``tags`` describe the whole exchange rather than one
+        step, so on a child they stay ordinary metadata.
+        """
+        if origin.parent is not None:
+            return None
+        propagator = self._trace_attributes(
+            origin.session_id, attrs.pop("user_id", None), attrs.pop("tags", None))
+        if propagator is None:
+            return None
+        propagator.__enter__()
+        return propagator
 
-    def _pop(self, span) -> None:
-        stack = self._stack()
-        if stack and stack[-1] is span:
-            stack.pop()
-        elif span in stack:
-            stack.remove(span)
+    def _open_observation(self, name: str, as_type: str):
+        """Enter the SDK's observation context; returns (observation, context)."""
+        context = self.client.start_as_current_observation(name=name, as_type=as_type)
+        return context.__enter__(), context
 
     def _trace_attributes(self, session_id: str, user_id, tags):
         """Open trace-level attributes through whichever API this SDK offers.
@@ -360,13 +442,7 @@ class LangfuseTracer:
         without trace-level grouping, so this returns None and the root span
         is created bare.
         """
-        attrs: dict = {}
-        if session_id:
-            attrs["session_id"] = session_id
-        if user_id:
-            attrs["user_id"] = user_id
-        if tags:
-            attrs["tags"] = tags
+        attrs = _trace_attributes(session_id, user_id, tags)
         if not attrs:
             return None
         update_trace = getattr(self.client, "update_current_trace", None)
@@ -380,40 +456,20 @@ class LangfuseTracer:
         return propagate_attributes(**attrs)
 
     def start(self, name: str, as_type: str = "span", **attrs) -> _LangfuseSpan:
-        stack = self._stack()
-        parent = stack[-1] if stack else None
-        session_id = attrs.pop("session_id", None)
-        if session_id is None:
-            session_id = parent.session_id if parent is not None else ""
-        round_idx = attrs.pop("round", None)
-        trace_id = parent.trace_id if parent is not None else uuid.uuid4().hex
-        # user/tags describe the whole exchange, not one step: on a child they
-        # stay metadata, on the root they become trace attributes
-        user_id = attrs.pop("user_id", None) if parent is None else None
-        tags = attrs.pop("tags", None) if parent is None else None
-
-        propagator = None
-        if parent is None:
-            propagator = self._trace_attributes(session_id, user_id, tags)
-        if propagator is not None:
-            propagator.__enter__()
+        origin = self._origin(attrs)
+        propagator = self._open_trace_attributes(origin, attrs)
         try:
-            context = self.client.start_as_current_observation(
-                name=name, as_type=as_type)
-            observation = context.__enter__()
+            observation, context = self._open_observation(name, as_type)
         except BaseException:
             # a half-entered attribute context would leak into every later
             # span on this thread
-            if propagator is not None:
-                propagator.__exit__(None, None, None)
+            _exit_quietly(propagator)
             raise
-        span = _LangfuseSpan(
-            self, observation, context, name, as_type, parent, trace_id,
-            session_id, round_idx, propagator=propagator)
-        if round_idx is not None:
-            attrs["round"] = round_idx
+        span = _LangfuseSpan(self, observation, context, name, as_type, origin, propagator)
+        if origin.round_idx is not None:
+            attrs["round"] = origin.round_idx
         span.update(**attrs)
-        stack.append(span)
+        self._spans.push(span)
         return span
 
     def flush(self) -> None:
@@ -424,6 +480,8 @@ class LangfuseTracer:
 
 
 class SafeSpan(Span):
+    """A span whose backend failures warn instead of raising."""
+
     def __init__(self, span, on_error):
         self._span = span
         self._on_error = on_error
@@ -448,24 +506,20 @@ class SafeSpan(Span):
 
 
 class SafeTracer:
+    """A tracer whose failures degrade to a no-op and one warning per process."""
+
     def __init__(self, tracer):
         self._tracer = tracer
-        self._warned = False
-        self._lock = threading.Lock()
+        self._once = _Once()
 
     @property
     def capture_content(self) -> bool:
         return bool(getattr(self._tracer, "capture_content", False))
 
     def _warn(self, exc: BaseException) -> None:
-        with self._lock:
-            if self._warned:
-                return
-            self._warned = True
-        try:
-            _general.warning("event=trace_error error_type=%s", type(exc).__name__)
-        except Exception:  # noqa: BLE001, S110 - a warning is best-effort
-            pass
+        if not self._once.claim():
+            return
+        _warn_event("event=trace_error error_type=%s", type(exc).__name__)
 
     def start(self, name: str, as_type: str = "span", **attrs) -> SafeSpan:
         try:
@@ -484,8 +538,12 @@ class SafeTracer:
             self._warn(e)
 
 
-def _truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+def _warn_event(message: str, *args) -> None:
+    """A tracing warning is best-effort: logging must not break a run either."""
+    try:
+        _general.warning(message, *args)
+    except Exception:  # noqa: BLE001, S110 - a warning is best-effort
+        pass
 
 
 def _default_trace_path() -> Path:
@@ -493,10 +551,47 @@ def _default_trace_path() -> Path:
 
 
 def _warn_disabled(reason: str) -> None:
+    _warn_event("event=trace_disabled reason=%s", reason)
+
+
+def _max_trace_bytes() -> int:
+    """``CORECODER_TRACE_MAX_MB`` in bytes, with the built-in cap on bad input."""
+    max_mb = os.getenv("CORECODER_TRACE_MAX_MB")
     try:
-        _general.warning("event=trace_disabled reason=%s", reason)
-    except Exception:  # noqa: BLE001, S110 - a warning is best-effort
-        pass
+        return int(float(max_mb) * 1024 * 1024) if max_mb else _DEFAULT_MAX_BYTES
+    except ValueError:
+        return _DEFAULT_MAX_BYTES
+
+
+def _jsonl_tracer(file, capture_content: bool):
+    """The JSONL backend, or a NullTracer when its path cannot be opened."""
+    explicit = file if file is not None else os.getenv("CORECODER_TRACE_FILE")
+    path = Path(explicit) if explicit else _default_trace_path()
+    try:
+        return SafeTracer(JsonlTracer(
+            path, capture_content=capture_content, max_bytes=_max_trace_bytes(),
+            prune=explicit is None))
+    except Exception as e:  # noqa: BLE001 - unwritable path is not fatal
+        _warn_disabled(f"jsonl_{type(e).__name__}")
+        return NullTracer()
+
+
+def _langfuse_tracer(capture_content: bool):
+    """The Langfuse backend, or a NullTracer when the SDK or keys are missing."""
+    try:
+        return SafeTracer(LangfuseTracer(capture_content=capture_content))
+    except Exception as e:  # noqa: BLE001 - missing SDK/keys is not fatal
+        _warn_disabled(f"langfuse_{type(e).__name__}")
+        return NullTracer()
+
+
+def _resolve_capture_content(capture_content: bool | None) -> bool:
+    """The flag decides once, here: an explicit argument beats the env switch."""
+    if capture_content is None:
+        capture_content = truthy(os.getenv("CORECODER_TRACE_CONTENT"))
+    if capture_content:
+        _warn_content_enabled()
+    return capture_content
 
 
 def create_tracer(backend: str | None = None, *, file=None,
@@ -505,56 +600,149 @@ def create_tracer(backend: str | None = None, *, file=None,
     or cannot start. Degradation is always a warning, never an exception."""
     backend = (backend if backend is not None
                else os.getenv("CORECODER_TRACE", "off")).strip().lower()
-    if backend in ("", "off", "none", "0"):
+    if backend in _OFF_BACKENDS:
         return NullTracer()
 
-    if capture_content is None:
-        capture_content = _truthy(os.getenv("CORECODER_TRACE_CONTENT"))
-    if capture_content:
-        _warn_disabled_content()
-
+    capture_content = _resolve_capture_content(capture_content)
     if backend == "jsonl":
-        explicit = file if file is not None else os.getenv("CORECODER_TRACE_FILE")
-        path = Path(explicit) if explicit else _default_trace_path()
-        max_mb = os.getenv("CORECODER_TRACE_MAX_MB")
-        try:
-            max_bytes = int(float(max_mb) * 1024 * 1024) if max_mb else 100 * 1024 * 1024
-        except ValueError:
-            max_bytes = 100 * 1024 * 1024
-        try:
-            return SafeTracer(JsonlTracer(
-                path, capture_content=capture_content, max_bytes=max_bytes,
-                prune=explicit is None))
-        except Exception as e:  # noqa: BLE001 - unwritable path is not fatal
-            _warn_disabled(f"jsonl_{type(e).__name__}")
-            return NullTracer()
-
+        return _jsonl_tracer(file, capture_content)
     if backend == "langfuse":
-        try:
-            return SafeTracer(LangfuseTracer(capture_content=capture_content))
-        except Exception as e:  # noqa: BLE001 - missing SDK/keys is not fatal
-            _warn_disabled(f"langfuse_{type(e).__name__}")
-            return NullTracer()
+        return _langfuse_tracer(capture_content)
 
     _warn_disabled(f"unknown_backend_{backend}")
     return NullTracer()
 
 
-_CONTENT_WARNED = False
+_CONTENT_WARNED = _Once()
 
 
-def _warn_disabled_content() -> None:
-    global _CONTENT_WARNED
-    if _CONTENT_WARNED:
+def _warn_content_enabled() -> None:
+    """Say once that content capture writes source code and prompts to disk."""
+    if not _CONTENT_WARNED.claim():
         return
-    _CONTENT_WARNED = True
-    try:
-        _general.warning(
-            "event=trace_content_enabled note=%s",
-            "content includes source and prompts; redaction is best-effort",
-        )
-    except Exception:  # noqa: BLE001, S110 - a warning is best-effort
-        pass
+    _warn_event(
+        "event=trace_content_enabled note=%s",
+        "content includes source and prompts; redaction is best-effort",
+    )
+
+
+def _round_fields(round_idx) -> dict:
+    """An omitted round means "the caller did not know", not round zero."""
+    return {} if round_idx is None else {"round": round_idx}
+
+
+class GenerationTrace:
+    """The recording handle for one model call.
+
+    ``record`` speaks the same metric names the audit line uses, so the two
+    streams describe a call with one vocabulary.
+    """
+
+    def __init__(self, span, capture_content: bool) -> None:
+        self._span = span
+        self._capture = capture_content
+
+    def record(self, metrics: dict) -> None:
+        self._span.update(**metrics)
+
+    def capture_output(self, text: str) -> None:
+        if self._capture:
+            self._span.update(output=text)
+
+
+class RunTrace:
+    """The agent's view of a trace: one run, its rounds and its tool calls.
+
+    Business code says what happened ("this round reported 5 prompt tokens",
+    "this call took 12ms"); this class owns the span keys, the lazy history
+    snapshot, the replayed interval of a tool span opened after the fact, and
+    the fact that all of it is a no-op while tracing is off.
+    """
+
+    def __init__(self, tracer) -> None:
+        self._tracer = tracer
+        self._capture = bool(getattr(tracer, "capture_content", False))
+        self._root = None
+
+    # ── one chat run ──────────────────────────────────────────────────────
+    def start_run(self, *, model, session_id, version, max_rounds) -> None:
+        """Open the root span the whole run hangs from."""
+        self._root = self._tracer.start(
+            "agent.chat", model=model, session_id=session_id,
+            version=version, max_rounds=max_rounds)
+
+    def capture_request(self, text: str) -> None:
+        """Record the user message that opened the run."""
+        if self._capture and self._root is not None:
+            self._root.update(input=text)
+
+    def event(self, name: str, **fields) -> None:
+        """Mark a point in time on the run: a truncation, a backfill, a retry."""
+        if self._root is not None:
+            self._root.event(name, **fields)
+
+    def end_run(self, **fields) -> None:
+        """Close the root span; later events are dropped rather than orphaned."""
+        root, self._root = self._root, None
+        if root is not None:
+            root.end(**fields)
+
+    # ── model calls ───────────────────────────────────────────────────────
+    @contextmanager
+    def llm_round(self, round_idx, *, model, estimated_prompt, messages=None):
+        """Trace one model call.
+
+        ``messages`` is a callable so the history is snapshotted only when
+        content capture is on: the whole transcript is not cheap to copy, and
+        off is the default.
+        """
+        with self._tracer.start(
+            "llm.round", as_type="generation", **_round_fields(round_idx),
+            model=model, estimated_prompt=estimated_prompt,
+        ) as span:
+            if self._capture and messages is not None:
+                span.update(input=messages())
+            yield GenerationTrace(span, self._capture)
+
+    # ── tool calls ────────────────────────────────────────────────────────
+    def tool_span(self, *, tool, round_idx=None, args_chars=0,
+                  measured_ms=None, started_at=None):
+        """Open a call's span.
+
+        A parallel worker cannot push onto the tracer's thread-local stack, so
+        its span is opened on the caller's thread after the call is over and
+        would otherwise report duration_ms=0. Passing the ``measured_ms`` the
+        worker timed (and the wall-clock ``started_at`` it began at) replays
+        the real interval instead.
+        """
+        span = self._tracer.start(
+            f"tool.{tool}", as_type="tool", **_round_fields(round_idx),
+            args_chars=args_chars)
+        if measured_ms is not None:
+            duration = measured_ms / 1000
+            begin = started_at if started_at is not None else time.time() - duration
+            span.retime(begin, begin + duration)
+        return span
+
+    def tool_finished(self, span, *, tool, call_id, decision, attrs,
+                      request_text=None, response_text=None) -> None:
+        """Close a call's span with its outcome and its captured I/O.
+
+        ``request_text``/``response_text`` are recorded only when content
+        capture is on. A refusal that quotes broken JSON is never copied back
+        out as the call's output.
+        """
+        fields = dict(attrs, decision=decision, tool=tool, call_id=call_id)
+        if self._capture:
+            if request_text is not None:
+                fields["input"] = request_text
+            if response_text is not None and decision != "bad_arguments":
+                fields["output"] = response_text
+        span.end(**fields)
+
+    def tool_failed(self, span, exc: BaseException) -> None:
+        """Close a span whose call escaped (Ctrl+C, a BaseException from a tool)."""
+        span.end(error=f"{type(exc).__name__}: {exc}")
 
 
 _os_write = os.write

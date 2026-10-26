@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 
 from .context import ContextManager, estimate_tokens
 from .llm import LLM, is_context_length_error
@@ -26,8 +27,9 @@ from .session import new_session_id
 from .tools import ALL_TOOLS
 from .tools.agent import AgentTool
 from .tools.base import Tool, ToolRefused
+from .tools.bash import get_tracked_cwd, set_tracked_cwd
 from .tools.todo import TodoWriteTool
-from .tracing import create_tracer
+from .tracing import RunTrace, create_tracer
 
 
 class TruncatedOutput(RuntimeError):
@@ -35,6 +37,22 @@ class TruncatedOutput(RuntimeError):
     cut off and nothing was executed. Raised instead of returned: a return
     value is dropped by the streaming REPL, ignored by one-shot mode and read
     as success by sub-agents, so the failure would be invisible."""
+
+
+@dataclass
+class _RunStats:
+    """What one ``chat()`` accumulates for the run summary and the root span."""
+
+    started: float
+    cost_before: float | None
+    outcome: str = "max_rounds"
+    error_type: str | None = None
+    executed: int = 0        # tool calls that actually ran
+    rounds: int = 0
+    tool_calls: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    usage_reported: bool = True
 
 
 class Agent:
@@ -53,7 +71,9 @@ class Agent:
         self.llm = llm
         self.session_id = session_id or new_session_id()
         self.tracer = tracer if tracer is not None else create_tracer()
-        self._root_span = None
+        # everything the loop reports about tracing goes through this adapter,
+        # so the loop itself never names a span or a capture flag
+        self._trace = RunTrace(self.tracer)
         # call ids whose refusal quotes raw streamed JSON; content capture
         # shows a placeholder for these instead of copying it into the trace
         self._trace_withheld: set[str] = set()
@@ -118,247 +138,203 @@ class Agent:
         from . import __version__
 
         self.messages.append({"role": "user", "content": user_input})
-        root = self.tracer.start(
-            "agent.chat",
-            model=getattr(self.llm, "model", ""),
-            session_id=self.session_id,
-            version=__version__,
-            max_rounds=self.max_rounds,
-        )
-        self._root_span = root
-        if self.tracer.capture_content:
-            root.update(input=user_input)
-        started = time.perf_counter()
-        cost_before = self._estimated_cost()
-        outcome = "max_rounds"
-        error_type = None
-        rounds = 0
-        tool_calls = 0
-        tokens_in = 0
-        tokens_out = 0
-        usage_reported = True
-        stats = {"executed": 0}
-
+        self._trace.start_run(
+            model=self._model, session_id=self.session_id,
+            version=__version__, max_rounds=self.max_rounds)
+        self._trace.capture_request(user_input)
+        run = _RunStats(started=time.perf_counter(), cost_before=self._estimated_cost())
         try:
+            return self._run_rounds(run, on_token, on_tool, on_reasoning)
+        except (Exception, KeyboardInterrupt) as e:
+            run.outcome = _outcome_of(e)
+            run.error_type = type(e).__name__
+            raise
+        finally:
+            self._finish_run(run)
+
+    @property
+    def _model(self) -> str:
+        """The model name as the audit line and the span both report it."""
+        return getattr(self.llm, "model", "")
+
+    def _run_rounds(self, run, on_token, on_tool, on_reasoning) -> str:
+        """Drive LLM and tool rounds until the model answers or the cap hits."""
+        self.context.maybe_compress(
+            self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
+
+        truncated_rounds = 0  # M2 guard: consecutive truncation counter
+        for round_idx in range(self.max_rounds):
+            current_round = round_idx + 1
+            run.rounds = current_round
+            resp = self._model_round(current_round, run, on_token, on_reasoning)
+            # M2: truncated response with tool_calls -> do NOT execute anything
+            if resp.finish_reason == "length" and resp.tool_calls:
+                truncated_rounds += 1
+                self._refuse_truncated(resp, truncated_rounds, current_round)
+                continue
+            # reset consecutive counter on a successful non-truncated round
+            truncated_rounds = 0
+
+            # no tool calls -> LLM is done, return text
+            if not resp.tool_calls:
+                self.messages.append(resp.message)
+                run.outcome = "answer"
+                return resp.content
+
+            self._tool_round(resp, on_tool, current_round, run)
             self.context.maybe_compress(
                 self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
 
-            truncated_rounds = 0  # M2 guard: consecutive truncation counter
-            for round_idx in range(self.max_rounds):
-                current_round = round_idx + 1
-                rounds = current_round
-                # history + system + tool schemas, the same composition the
-                # compression calls and the 400 fallback use; _full_messages()
-                # already carries the system message, so adding the fixed
-                # overhead to it would count that prompt twice
-                estimated_prompt = (
-                    estimate_tokens(self.messages) + self._fixed_prompt_tokens())
-                call_started = time.perf_counter()
-                call_cost_before = self._estimated_cost()
-                retried = False
-                with self.tracer.start(
-                    "llm.round", as_type="generation",
-                    **self._round_fields(current_round),
-                    model=getattr(self.llm, "model", ""),
-                    estimated_prompt=estimated_prompt,
-                ) as llm_span:
-                    if self.tracer.capture_content:
-                        llm_span.update(input=self._trace_messages())
-                    try:
-                        resp = self.llm.chat(
-                            messages=self._full_messages(),
-                            tools=self._tool_schemas(),
-                            on_token=on_token,
-                            on_reasoning=on_reasoning,
-                        )
-                    except Exception as e:
-                        # provider tokenizers and our estimate never agree exactly, so a
-                        # rejection is the last line of defence: collapse once and
-                        # re-issue. A too-short history cannot free enough to help.
-                        if not is_context_length_error(e) or len(self.messages) <= 4:
-                            raise
-                        before_messages = len(self.messages)
-                        before_tokens = (estimate_tokens(self.messages)
-                                         + self._fixed_prompt_tokens())
-                        self.context.force_collapse(self.messages, self.llm)
-                        log_event(
-                            "context_overflow",
-                            messages_before=before_messages,
-                            messages_after=len(self.messages),
-                            estimated_before=before_tokens,
-                            estimated_after=(
-                                estimate_tokens(self.messages) + self._fixed_prompt_tokens()),
-                            error_type=type(e).__name__,
-                        )
-                        self._trace_event(
-                            "context_overflow", messages_before=before_messages,
-                            messages_after=len(self.messages),
-                            error_type=type(e).__name__)
-                        retried = True
-                        resp = self.llm.chat(
-                            messages=self._full_messages(),
-                            tools=self._tool_schemas(),
-                            on_token=on_token,
-                            on_reasoning=on_reasoning,
-                        )
+        if truncated_rounds:
+            # the cap ran out on a truncated round, so no re-issue ever
+            # happened: still raise, or a small max_rounds would bring back
+            # the silent return this guard exists to remove
+            raise TruncatedOutput(
+                "model output truncated; raise max_tokens "
+                "(CORECODER_MAX_TOKENS) or reduce the request"
+            )
+        log_event("max_rounds", level=logging.WARNING, rounds=self.max_rounds)
+        return "(reached maximum tool-call rounds)"
 
-                    log_event(
-                        "llm_call", round=current_round,
-                        model=getattr(self.llm, "model", ""),
-                        estimated_prompt=estimated_prompt,
-                        prompt_tokens=resp.prompt_tokens if resp.usage_reported else None,
-                        completion_tokens=(
-                            resp.completion_tokens if resp.usage_reported else None),
-                        usage_reported=resp.usage_reported,
-                        finish_reason=resp.finish_reason,
-                        tool_calls=len(resp.tool_calls),
-                        duration_ms=round((time.perf_counter() - call_started) * 1000, 3),
-                        retried=retried,
-                        cost_usd=_cost_delta(call_cost_before, self._estimated_cost()),
-                    )
-                    llm_span.update(
-                        prompt_tokens=resp.prompt_tokens if resp.usage_reported else None,
-                        completion_tokens=(
-                            resp.completion_tokens if resp.usage_reported else None),
-                        usage_reported=resp.usage_reported,
-                        finish_reason=resp.finish_reason,
-                        tool_calls=len(resp.tool_calls),
-                        duration_ms=round((time.perf_counter() - call_started) * 1000, 3),
-                        retried=retried,
-                        cost_usd=_cost_delta(call_cost_before, self._estimated_cost()),
-                    )
-                    if self.tracer.capture_content:
-                        llm_span.update(output=resp.content or "")
+    def _model_round(self, current_round: int, run, on_token, on_reasoning):
+        """One model call: trace it, log it, and account for its tokens.
 
-                if resp.usage_reported:
-                    tokens_in += resp.prompt_tokens
-                    tokens_out += resp.completion_tokens
-                else:
-                    usage_reported = False
-
-                # M2: truncated response with tool_calls -> do NOT execute anything
-                if resp.finish_reason == "length" and resp.tool_calls:
-                    truncated_rounds += 1
-                    log_event(
-                        "output_truncated",
-                        consecutive=truncated_rounds,
-                        tool_calls=len(resp.tool_calls),
-                        round=current_round,
-                    )
-                    self._trace_event(
-                        "output_truncated", consecutive=truncated_rounds,
-                        tool_calls=len(resp.tool_calls), round=current_round)
-                    self._answer_truncated_tool_calls(resp)
-                    if truncated_rounds >= 2:
-                        # the history is already valid, so a retry or /save still works
-                        raise TruncatedOutput(
-                            "model output truncated twice; raise max_tokens "
-                            "(CORECODER_MAX_TOKENS) or reduce the request"
-                        )
-                    continue
-
-                # no tool calls -> LLM is done, return text
-                if not resp.tool_calls:
-                    self.messages.append(resp.message)
-                    outcome = "answer"
-                    return resp.content
-
-                # reset consecutive counter on a successful non-truncated round
-                truncated_rounds = 0
-
-                # tool calls -> execute (parallel when multiple, like Claude Code's
-                # StreamingToolExecutor which runs independent tools concurrently)
-                self.messages.append(resp.message)
-                tool_calls += len(resp.tool_calls)
-
-                try:
-                    self._execute_round(
-                        resp, on_tool, round_idx=current_round, stats=stats)
-                finally:
-                    # any escape from the round (Ctrl+C, a crashing on_tool or ask
-                    # callback, a BaseException from a tool) would leave the
-                    # assistant tool_calls message without replies and poison
-                    # every later request, so the backfill is unconditional and
-                    # idempotent: on a clean round it is a no-op
-                    self._answer_pending_tool_calls(resp.tool_calls)
-
-                # compress if tool outputs are big
-                self.context.maybe_compress(
-                    self.messages, self.llm, fixed_tokens=self._fixed_prompt_tokens())
-
-            if truncated_rounds:
-                # the cap ran out on a truncated round, so no re-issue ever
-                # happened: still raise, or a small max_rounds would bring back
-                # the silent return this guard exists to remove
-                raise TruncatedOutput(
-                    "model output truncated; raise max_tokens "
-                    "(CORECODER_MAX_TOKENS) or reduce the request"
-                )
-            log_event("max_rounds", level=logging.WARNING, rounds=self.max_rounds)
-            return "(reached maximum tool-call rounds)"
-        except TruncatedOutput as e:
-            outcome = "truncated"
-            error_type = type(e).__name__
-            raise
-        except KeyboardInterrupt as e:
-            outcome = "interrupted"
-            error_type = type(e).__name__
-            raise
-        except Exception as e:
-            outcome = "error"
-            error_type = type(e).__name__
-            raise
-        finally:
+        history + system + tool schemas, the same composition the compression
+        calls and the 400 fallback use; _full_messages() already carries the
+        system message, so adding the fixed overhead to it would count that
+        prompt twice
+        """
+        estimated_prompt = estimate_tokens(self.messages) + self._fixed_prompt_tokens()
+        call_started = time.perf_counter()
+        call_cost_before = self._estimated_cost()
+        retried = False
+        with self._trace.llm_round(
+            current_round, model=self._model, estimated_prompt=estimated_prompt,
+            messages=self._trace_messages,
+        ) as call:
             try:
-                self._log_run_summary(
-                    outcome=outcome, rounds=rounds, tool_calls=tool_calls,
-                    tools_executed=stats["executed"], tokens_in=tokens_in,
-                    tokens_out=tokens_out, usage_reported=usage_reported,
-                    cost_before=cost_before, started=started,
-                )
-            finally:
-                self._root_span = None
-                fields = {
-                    "outcome": outcome,
-                    "rounds": rounds,
-                    "tool_calls": tool_calls,
-                    "tools_executed": stats["executed"],
-                    "tokens_in": tokens_in,
-                    "tokens_out": tokens_out,
-                    "usage_reported": usage_reported,
-                    "cost_usd": _cost_delta(cost_before, self._estimated_cost()),
-                }
-                if error_type is not None:
-                    fields["error"] = error_type
-                root.end(**fields)
+                resp = self._chat_once(on_token, on_reasoning)
+            except Exception as e:
+                # provider tokenizers and our estimate never agree exactly, so a
+                # rejection is the last line of defence: collapse once and
+                # re-issue. A too-short history cannot free enough to help.
+                if not is_context_length_error(e) or len(self.messages) <= 4:
+                    raise
+                resp = self._recover_overflow(e, on_token, on_reasoning)
+                retried = True
+            metrics = _call_metrics(resp, call_started, call_cost_before,
+                                    self._estimated_cost(), retried)
+            log_event("llm_call", round=current_round, model=self._model,
+                      estimated_prompt=estimated_prompt, **metrics)
+            call.record(metrics)
+            call.capture_output(resp.content or "")
+        self._account_usage(run, resp)
+        return resp
+
+    def _chat_once(self, on_token, on_reasoning):
+        return self.llm.chat(
+            messages=self._full_messages(), tools=self._tool_schemas(),
+            on_token=on_token, on_reasoning=on_reasoning)
+
+    def _recover_overflow(self, error, on_token, on_reasoning):
+        """The provider called the request too long: collapse once and retry."""
+        before_messages = len(self.messages)
+        before_tokens = estimate_tokens(self.messages) + self._fixed_prompt_tokens()
+        self.context.force_collapse(self.messages, self.llm)
+        after_tokens = estimate_tokens(self.messages) + self._fixed_prompt_tokens()
+        error_type = type(error).__name__
+        log_event(
+            "context_overflow",
+            messages_before=before_messages,
+            messages_after=len(self.messages),
+            estimated_before=before_tokens,
+            estimated_after=after_tokens,
+            error_type=error_type,
+        )
+        # the trace event stays without the estimates: a span event is a marker
+        self._trace.event("context_overflow", messages_before=before_messages,
+                          messages_after=len(self.messages), error_type=error_type)
+        return self._chat_once(on_token, on_reasoning)
+
+    @staticmethod
+    def _account_usage(run, resp) -> None:
+        """Only reported usage becomes a total; unreported zeros stay unknown."""
+        if resp.usage_reported:
+            run.tokens_in += resp.prompt_tokens
+            run.tokens_out += resp.completion_tokens
+        else:
+            run.usage_reported = False
+
+    def _tool_round(self, resp, on_tool, current_round: int, run) -> None:
+        """Execute one round of tool calls, then backfill any missing replies."""
+        self.messages.append(resp.message)
+        run.tool_calls += len(resp.tool_calls)
+        try:
+            self._execute_round(resp, on_tool, round_idx=current_round, stats=run)
+        finally:
+            # any escape from the round (Ctrl+C, a crashing on_tool or ask
+            # callback, a BaseException from a tool) would leave the
+            # assistant tool_calls message without replies and poison
+            # every later request, so the backfill is unconditional and
+            # idempotent: on a clean round it is a no-op
+            self._answer_pending_tool_calls(resp.tool_calls)
+
+    def _refuse_truncated(self, resp, consecutive: int, current_round: int) -> None:
+        """Answer every truncated tool call with a hint instead of running it."""
+        self._record("output_truncated", consecutive=consecutive,
+                     tool_calls=len(resp.tool_calls), round=current_round)
+        self._answer_truncated_tool_calls(resp)
+        if consecutive >= 2:
+            # the history is already valid, so a retry or /save still works
+            raise TruncatedOutput(
+                "model output truncated twice; raise max_tokens "
+                "(CORECODER_MAX_TOKENS) or reduce the request"
+            )
+
+    def _record(self, name: str, level: int = logging.INFO, **fields) -> None:
+        """One event for both sinks: the audit line and the run's span."""
+        log_event(name, level=level, **fields)
+        self._trace.event(name, **fields)
+
+    def _finish_run(self, run) -> None:
+        """Close the run: the audit summary first, then the root span."""
+        try:
+            self._log_run_summary(run)
+        finally:
+            fields = {
+                "outcome": run.outcome,
+                "rounds": run.rounds,
+                "tool_calls": run.tool_calls,
+                "tools_executed": run.executed,
+                "tokens_in": run.tokens_in,
+                "tokens_out": run.tokens_out,
+                "usage_reported": run.usage_reported,
+                "cost_usd": _cost_delta(run.cost_before, self._estimated_cost()),
+            }
+            if run.error_type is not None:
+                fields["error"] = run.error_type
+            self._trace.end_run(**fields)
 
     def _estimated_cost(self) -> float | None:
         return getattr(self.llm, "estimated_cost", None)
 
-    def _trace_event(self, name: str, **fields) -> None:
-        span = self._root_span
-        if span is not None:
-            span.event(name, **fields)
-
-    def _log_run_summary(self, *, outcome, rounds, tool_calls, tools_executed,
-                         tokens_in, tokens_out, usage_reported, cost_before,
-                         started) -> None:
+    def _log_run_summary(self, run) -> None:
         from . import __version__
         log_event(
             "run_summary",
             session=self.session_id,
             version=__version__,
             build=os.getenv("CORECODER_BUILD", ""),
-            model=getattr(self.llm, "model", ""),
-            outcome=outcome,
-            rounds=rounds,
-            tool_calls=tool_calls,
-            tools_executed=tools_executed,
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
-            usage_reported=usage_reported,
-            cost_usd=_cost_delta(cost_before, self._estimated_cost()),
-            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            model=self._model,
+            outcome=run.outcome,
+            rounds=run.rounds,
+            tool_calls=run.tool_calls,
+            tools_executed=run.executed,
+            tokens_in=run.tokens_in,
+            tokens_out=run.tokens_out,
+            usage_reported=run.usage_reported,
+            cost_usd=_cost_delta(run.cost_before, self._estimated_cost()),
+            duration_ms=round((time.perf_counter() - run.started) * 1000, 3),
         )
 
     def _answer_truncated_tool_calls(self, resp) -> None:
@@ -379,54 +355,57 @@ class Agent:
         """Execute one tool-call round: single calls inline, multiple calls in
         parallel, appending one tool reply per call to the history."""
         if len(resp.tool_calls) == 1:
-            tc = resp.tool_calls[0]
-            if on_tool:
-                on_tool(tc.name, tc.arguments)
-            # a call with broken arguments is rejected before hooks and
-            # consent: no side effect, and nobody is asked to approve junk
-            tool_span = self.tracer.start(
-                f"tool.{tc.name}", as_type="tool",
-                **self._round_fields(round_idx),
-                args_chars=self._args_chars(tc),
-            )
-            try:
-                start = time.perf_counter()
-                result, decision = self._decide(tc)
-                decision_ms = int((time.perf_counter() - start) * 1000)
-                self._log_decision(tc, decision, decision_ms, round_idx)
-                meta: dict = {"decision_ms": decision_ms}
-                if result is None:
-                    result = self._exec_tool(tc, meta)
-                    self._post_hooks(tc, result)
-                    if stats is not None and not meta.get("refused"):
-                        stats["executed"] += 1
-                else:
-                    meta.update(chars_in=len(result), chars_out=len(result),
-                                error_text=result.startswith("Error:"))
-                self._log_result(tc, decision, meta, round_idx, result=result,
-                                 span=tool_span)
-            except BaseException as e:
-                # an escape (Ctrl+C, a BaseException from a tool or a hook) skips
-                # _log_result, which is what normally ends the span. Left open it
-                # would lose the call from the trace and keep naming it in every
-                # later audit line, so close it here; end() is idempotent.
-                tool_span.end(error=f"{type(e).__name__}: {e}")
-                raise
-            self.messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
+            self._execute_single(resp.tool_calls[0], on_tool, round_idx, stats)
+            return
+        # parallel execution for multiple tool calls
+        results = self._exec_tools_parallel(
+            resp.tool_calls, on_tool, round_idx, stats=stats)
+        for tc, result in zip(resp.tool_calls, results):
+            self._append_tool_reply(tc, result)
+
+    def _execute_single(self, tc, on_tool, round_idx, stats) -> None:
+        """Run one call inline, closing its span even when the call escapes."""
+        if on_tool:
+            on_tool(tc.name, tc.arguments)
+        span = self._trace.tool_span(
+            tool=tc.name, round_idx=round_idx, args_chars=self._args_chars(tc))
+        try:
+            result = self._settle_and_run(tc, round_idx, stats, span=span)
+        except BaseException as e:
+            # an escape (Ctrl+C, a BaseException from a tool or a hook) skips
+            # _log_result, which is what normally ends the span. Left open it
+            # would lose the call from the trace and keep naming it in every
+            # later audit line, so close it here; end() is idempotent.
+            self._trace.tool_failed(span, e)
+            raise
+        self._append_tool_reply(tc, result)
+
+    def _settle_and_run(self, tc, round_idx, stats, span=None) -> str:
+        """Settle consent for one call, execute it, record the outcome."""
+        # a call with broken arguments is rejected before hooks and
+        # consent: no side effect, and nobody is asked to approve junk
+        start = time.perf_counter()
+        result, decision = self._decide(tc)
+        decision_ms = int((time.perf_counter() - start) * 1000)
+        self._log_decision(tc, decision, decision_ms, round_idx)
+        meta: dict = {"decision_ms": decision_ms}
+        if result is None:
+            result = self._exec_tool(tc, meta)
+            self._post_hooks(tc, result)
+            if stats is not None and not meta.get("refused"):
+                stats.executed += 1
         else:
-            # parallel execution for multiple tool calls
-            results = self._exec_tools_parallel(
-                resp.tool_calls, on_tool, round_idx, stats=stats)
-            for tc, result in zip(resp.tool_calls, results):
-                self.messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
+            meta.update(chars_in=len(result), chars_out=len(result),
+                        error_text=result.startswith("Error:"))
+        self._log_result(tc, decision, meta, round_idx, result=result, span=span)
+        return result
+
+    def _append_tool_reply(self, tc, result: str) -> None:
+        self.messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": result,
+        })
 
     @staticmethod
     def _round_fields(round_idx) -> dict:
@@ -455,60 +434,23 @@ class Agent:
 
     def _log_result(self, tc, decision: str, meta: dict, round_idx=None,
                     result: str | None = None, span=None) -> None:
-        refused = decision == "execute" and meta.get("refused", False)
-        effective = "tool_refused" if refused else decision
-        if effective == "execute":
-            outcome = "error" if meta.get("error_type") else "ok"
-        else:
-            outcome = "skipped"
-        fields = {
-            "effective_decision": effective,
-            "outcome": outcome,
-            "error_text": bool(meta.get("error_text", False)),
-            "duration_ms": meta.get("duration_ms", 0),
-            "decision_ms": meta.get("decision_ms", 0),
-            "chars_in": meta.get("chars_in", 0),
-            "chars_out": meta.get("chars_out", 0),
-            "truncated": bool(meta.get("truncated", False)),
-            "redacted": bool(meta.get("redacted", False)),
-            "error_type": meta.get("error_type", ""),
-        }
+        """Record one call's outcome: the audit line first, then its span."""
+        fields = _result_fields(decision, meta)
         if span is None:
-            span = self.tracer.start(
-                f"tool.{tc.name}", as_type="tool",
-                **self._round_fields(round_idx),
-                args_chars=self._args_chars(tc),
-            )
-            # A parallel worker cannot use the tracer's thread-local span stack,
-            # so its span is only opened here, after the call has finished, and
-            # would otherwise open and close in one instant (duration_ms=0).
-            # Replay the interval the worker measured, anchored at the moment
-            # execution actually began, so the record matches meta['duration_ms'].
-            duration = fields["duration_ms"] / 1000
-            started_at = meta.get("started_at")
-            if started_at is None:
-                started_at = time.time() - duration
-            span.retime(started_at, started_at + duration)
+            span = self._trace.tool_span(
+                tool=tc.name, round_idx=round_idx, args_chars=self._args_chars(tc),
+                measured_ms=fields["duration_ms"], started_at=meta.get("started_at"))
         # logged while the span is open: the audit line then carries the same
         # trace_id/span_id as the trace record describing this call
         log_event(
             "tool_result", **self._round_fields(round_idx), tool=tc.name,
             call_id=tc.id, **fields,
         )
-        trace_fields = dict(fields, decision=decision, tool=tc.name, call_id=tc.id)
         if decision == "bad_arguments":
             self._trace_withheld.add(tc.id)
-        if self.tracer.capture_content:
-            try:
-                trace_fields["input"] = _redact(
-                    json.dumps(tc.arguments, ensure_ascii=False))
-            except (TypeError, ValueError):
-                trace_fields["input"] = str(tc.arguments)
-            if result is not None and decision != "bad_arguments":
-                # a bad_arguments refusal quotes the raw streamed JSON; the
-                # trace must not become a second copy of it
-                trace_fields["output"] = result
-        span.end(**trace_fields)
+        self._trace.tool_finished(
+            span, tool=tc.name, call_id=tc.id, decision=decision, attrs=fields,
+            request_text=_request_text(tc), response_text=result)
 
     @staticmethod
     def _bad_arguments(tc) -> str | None:
@@ -682,15 +624,23 @@ class Agent:
         killed, so it may still write to the workspace after chat() returns;
         its result is discarded and the history gets `[interrupted]`.
         """
-        from .tools.bash import get_tracked_cwd, set_tracked_cwd
-
-        for tc in tool_calls:
-            if on_tool:
-                on_tool(tc.name, tc.arguments)
-
         # hooks and consent are settled up front on this thread: prompting
         # from pool workers would interleave several prompts on one terminal.
         # broken arguments short-circuit both: they are refused, not approved
+        results, metas = self._settle_batch(tool_calls, on_tool, round_idx)
+        self._run_workers(tool_calls, metas, results, round_idx)
+        for i in metas:
+            self._post_hooks(tool_calls[i], results[i])
+        if stats is not None:
+            stats.executed += sum(
+                1 for meta in metas.values() if not meta.get("refused"))
+        return results
+
+    def _settle_batch(self, tool_calls, on_tool, round_idx) -> tuple[list, dict]:
+        """Announce and settle every call, then record the ones already decided."""
+        for tc in tool_calls:
+            if on_tool:
+                on_tool(tc.name, tc.arguments)
         settled: list[tuple[str | None, str, int]] = []
         results: list[str | None] = []
         for tc in tool_calls:
@@ -700,36 +650,25 @@ class Agent:
             self._log_decision(tc, decision, decision_ms, round_idx)
             settled.append((result, decision, decision_ms))
             results.append(result)
-
+        metas: dict = {}
         for i, tc in enumerate(tool_calls):
             result, decision, decision_ms = settled[i]
-            if result is not None:
-                meta = {"decision_ms": decision_ms, "chars_in": len(result),
-                        "chars_out": len(result),
-                        "error_text": result.startswith("Error:")}
-                self._log_result(tc, decision, meta, round_idx, result=result)
+            if result is None:
+                metas[i] = {"decision_ms": decision_ms}
+                continue
+            meta = {"decision_ms": decision_ms, "chars_in": len(result),
+                    "chars_out": len(result), "error_text": result.startswith("Error:")}
+            self._log_result(tc, decision, meta, round_idx, result=result)
+        return results, metas
 
-        # the tracked cwd is thread-local, so pool workers would otherwise
-        # start from the launch directory: hand the session cwd in, and merge
-        # any cd back in call order so the batch behaves like a sequence
+    def _run_workers(self, tool_calls, metas, results, round_idx) -> None:
+        """Submit the settled calls, record each as it finishes, follow the cd.
+
+        The tracked cwd is thread-local, so pool workers would otherwise start
+        from the launch directory: hand the session cwd in, and merge any cd
+        back in call order so the batch behaves like a sequence.
+        """
         session_cwd = get_tracked_cwd()
-        metas = {
-            i: {"decision_ms": settled[i][2]}
-            for i, tc in enumerate(tool_calls)
-            if settled[i][0] is None
-        }
-        def run(i, tc, base_cwd):
-            is_bash = tc.name == "bash"
-            if is_bash and base_cwd is not None:
-                set_tracked_cwd(base_cwd)
-            out = self._exec_tool(tc, metas[i])
-            if not is_bash:
-                return i, out, None
-            cwd_after = get_tracked_cwd()
-            # only a worker that actually moved the dir reports back; a
-            # sibling that merely inherited the base must not revert a cd
-            return i, out, cwd_after if cwd_after != base_cwd else None
-
         # not a `with` block: its __exit__ calls shutdown(wait=True), so Ctrl+C
         # would block until every running tool returned. Queued calls are
         # cancelled instead; a call already running cannot be killed (threads
@@ -741,7 +680,7 @@ class Agent:
             max_workers=8, thread_name_prefix="cc-tool")
         try:
             futures = {
-                i: pool.submit(run, i, tc, session_cwd)
+                i: pool.submit(self._worker_call, i, tc, session_cwd, metas[i])
                 for i, tc in enumerate(tool_calls)
                 if i in metas
             }
@@ -754,19 +693,24 @@ class Agent:
                     set_tracked_cwd(worker_cwd)
         except BaseException:
             inflight = sum(not f.done() for f in futures.values())
-            log_event("batch_interrupted", level=logging.WARNING,
-                      submitted=len(futures), inflight=inflight)
-            self._trace_event("batch_interrupted",
-                              submitted=len(futures), inflight=inflight)
+            self._record("batch_interrupted", level=logging.WARNING,
+                         submitted=len(futures), inflight=inflight)
             raise
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
-        for i in futures:
-            self._post_hooks(tool_calls[i], results[i])
-        if stats is not None:
-            stats["executed"] += sum(
-                1 for meta in metas.values() if not meta.get("refused"))
-        return results
+
+    def _worker_call(self, i, tc, base_cwd, meta):
+        """One pool slot: run the tool, then report the cwd it left behind."""
+        is_bash = tc.name == "bash"
+        if is_bash and base_cwd is not None:
+            set_tracked_cwd(base_cwd)
+        out = self._exec_tool(tc, meta)
+        if not is_bash:
+            return i, out, None
+        cwd_after = get_tracked_cwd()
+        # only a worker that actually moved the dir reports back; a
+        # sibling that merely inherited the base must not revert a cd
+        return i, out, cwd_after if cwd_after != base_cwd else None
 
     def _answer_pending_tool_calls(self, tool_calls):
         """Backfill a tool reply for every call that didn't get one.
@@ -784,8 +728,7 @@ class Agent:
                 "content": "[interrupted]",
             })
         if pending:
-            log_event("backfill", count=len(pending))
-            self._trace_event("backfill", count=len(pending))
+            self._record("backfill", count=len(pending))
 
     def reset(self):
         """Clear conversation history."""
@@ -812,6 +755,60 @@ def _redact(text: str) -> str:
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def _request_text(tc) -> str:
+    """A call's arguments as text for content capture, secrets redacted."""
+    try:
+        return _redact(json.dumps(tc.arguments, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return _redact(str(tc.arguments))
+
+
+def _result_fields(decision: str, meta: dict) -> dict:
+    """The outcome vocabulary one tool call reports to both sinks."""
+    refused = decision == "execute" and meta.get("refused", False)
+    effective = "tool_refused" if refused else decision
+    if effective == "execute":
+        outcome = "error" if meta.get("error_type") else "ok"
+    else:
+        outcome = "skipped"
+    return {
+        "effective_decision": effective,
+        "outcome": outcome,
+        "error_text": bool(meta.get("error_text", False)),
+        "duration_ms": meta.get("duration_ms", 0),
+        "decision_ms": meta.get("decision_ms", 0),
+        "chars_in": meta.get("chars_in", 0),
+        "chars_out": meta.get("chars_out", 0),
+        "truncated": bool(meta.get("truncated", False)),
+        "redacted": bool(meta.get("redacted", False)),
+        "error_type": meta.get("error_type", ""),
+    }
+
+
+def _call_metrics(resp, call_started: float, cost_before, cost_after,
+                  retried: bool) -> dict:
+    """The fields one model call reports to both sinks."""
+    return {
+        "prompt_tokens": resp.prompt_tokens if resp.usage_reported else None,
+        "completion_tokens": resp.completion_tokens if resp.usage_reported else None,
+        "usage_reported": resp.usage_reported,
+        "finish_reason": resp.finish_reason,
+        "tool_calls": len(resp.tool_calls),
+        "duration_ms": round((time.perf_counter() - call_started) * 1000, 3),
+        "retried": retried,
+        "cost_usd": _cost_delta(cost_before, cost_after),
+    }
+
+
+def _outcome_of(exc: BaseException) -> str:
+    """The run-summary vocabulary for a failure that escaped the round loop."""
+    if isinstance(exc, TruncatedOutput):
+        return "truncated"
+    if isinstance(exc, KeyboardInterrupt):
+        return "interrupted"
+    return "error"
 
 
 def _cost_delta(before: float | None, after: float | None) -> float | None:
