@@ -696,3 +696,44 @@ def test_langfuse_error_is_reported_at_error_level():
     clean.start("tool.spy").end()
     assert all("level" not in u for u in quiet.observations[0].updates), \
         "a run that worked must not be marked up"
+
+
+def test_the_runs_answer_reaches_the_root_span(tmp_path):
+    """The trace list shows one field per trace and it was always empty (B4).
+
+    Each round carries its own text, but the first question about a run is what
+    it delivered, and the round-exhaustion placeholder never appeared anywhere.
+    """
+    path = tmp_path / "trace.jsonl"
+    make_agent(JsonlTracer(path, capture_content=True)).chat("go")
+
+    root = next(r for r in rows(path) if r["name"] == "agent.chat")
+    assert root["attrs"]["output"] == "done"
+
+
+def test_the_runs_answer_stays_hidden_without_content_capture(tmp_path):
+    """The answer is content, so the opt-in governs it like any other text."""
+    path = tmp_path / "trace.jsonl"
+    make_agent(JsonlTracer(path)).chat("go")
+
+    root = next(r for r in rows(path) if r["name"] == "agent.chat")
+    assert "output" not in root["attrs"]
+
+
+def test_the_fallback_answer_is_recorded_too(tmp_path):
+    """Running out of rounds is a delivery, not silence (B4).
+
+    The placeholder string is what the caller receives, so the trace must show
+    the same thing the user did instead of an empty output.
+    """
+    path = tmp_path / "trace.jsonl"
+    llm = scripted(*([LLMResponse(content="", tool_calls=[
+        ToolCall(id=f"c{i}", name="spy", arguments={"text": "x"})]) for i in range(8)]))
+    agent = make_agent(JsonlTracer(path, capture_content=True),
+                       tool=SpyTool(), llm=llm)
+
+    assert agent.chat("go") == "(reached maximum tool-call rounds)"
+
+    root = next(r for r in rows(path) if r["name"] == "agent.chat")
+    assert root["attrs"]["output"] == "(reached maximum tool-call rounds)"
+    assert root["attrs"]["outcome"] == "max_rounds"

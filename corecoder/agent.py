@@ -56,6 +56,9 @@ class _RunStats:
     tokens_in: int = 0
     tokens_out: int = 0
     usage_reported: bool = True
+    # what the run delivered; the root span shows it as the trace's output, so
+    # the trace list can answer "what did this run give back" at all
+    answer: str | None = None
 
 
 class Agent:
@@ -147,7 +150,9 @@ class Agent:
         self._trace.capture_request(user_input)
         run = _RunStats(started=time.perf_counter(), cost_before=self._estimated_cost())
         try:
-            return self._run_rounds(run, on_token, on_tool, on_reasoning)
+            answer = self._run_rounds(run, on_token, on_tool, on_reasoning)
+            run.answer = answer
+            return answer
         except BaseException as e:
             # BaseException, not Exception: a tool or a UI callback can die with
             # SystemExit or GeneratorExit, and those must not reach the summary
@@ -320,6 +325,10 @@ class Agent:
             }
             if run.error_type is not None:
                 fields["error"] = run.error_type
+            if run.answer is not None:
+                # the answer is content, so the capture switch filters it downstream
+                # like any other text: nothing here decides whether it is recorded
+                fields["output"] = run.answer
             self._trace.end_run(**fields)
 
     def _estimated_cost(self) -> float | None:
