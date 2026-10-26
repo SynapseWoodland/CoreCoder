@@ -1,8 +1,18 @@
-"""Structured audit logging and general logging setup.
+"""The audit stream, plus the package's general logger setup.
 
-The audit stream is deliberately separate from the ``corecoder`` logger: the
-latter defaults to WARNING, and audit events are INFO by design, so sharing it
-would hide every event until the user also turned on debug logging.
+Two jobs, deliberately independent:
+
+- the audit log: metadata-only events, its sink, its failure policy and its
+  retention. ``CORECODER_AUDIT`` switches it on, and it never shares the
+  ``corecoder`` logger because the latter defaults to WARNING while audit
+  events are INFO by design.
+- ``configure_logging``: the one place that configures that ``corecoder``
+  logger (hook warnings, MCP degradations, tracing fallbacks).
+
+Tracing is not here: spans, backends and the ``RunTrace`` adapter live in
+``tracing.py``. The two meet through ``current_trace_context``: an audit line
+carries the ids of the span that was open, so a line and its trace record can
+be joined.
 
 Audit events carry metadata only: tool names, decisions, timings and token
 counts. Arguments, results and user input never enter the log. ``log_event``
@@ -10,8 +20,7 @@ never raises: it runs from ``finally`` blocks where an exception would replace
 the real failure (a swallowed KeyboardInterrupt, for example).
 
 When tracing is on, each line also carries the ``trace_id``/``span_id`` of the
-span that was open, so the audit log and the span tree describe the same work
-and can be joined; tracing off simply omits the fields.
+span that was open, so the audit log and the span tree describe the same work.
 
 Sinks (first match wins):
 
@@ -20,6 +29,10 @@ Sinks (first match wins):
   terminal,
 - ``CORECODER_AUDIT_FILE`` or an explicit ``file=``,
 - ``~/.corecoder/audit.<pid>.log``.
+
+Three layers, top to bottom: which sink to use (``_build_handler`` and below),
+how a broken sink degrades (``_AuditState``), and how one line is shaped
+(``_format`` and ``log_event``).
 """
 
 from __future__ import annotations
@@ -31,7 +44,9 @@ import sys
 import threading
 from pathlib import Path
 
-_TRUTHY = {"1", "true", "yes", "on"}
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+# three failed writes in a row mean the sink is gone, not that a line was unlucky
+_FAILURES_BEFORE_DISABLE = 3
 
 audit_logger = logging.getLogger("corecoder.audit")
 audit_logger.propagate = False
@@ -39,15 +54,64 @@ audit_logger.propagate = False
 _general = logging.getLogger("corecoder")
 
 
-class _State:
+def truthy(value: str | None) -> bool:
+    """The ``1/true/yes/on`` spelling every switch in this package accepts."""
+    return (value or "").strip().lower() in _TRUTHY
+
+
+def _warn(message: str, *args) -> None:
+    """A diagnostic about the audit log must never become the failure."""
+    try:
+        _general.warning(message, *args)
+    except Exception:  # noqa: BLE001, S110 - a warning is best-effort
+        pass
+
+
+class _AuditState:
+    """The installed sink plus its failure policy.
+
+    Mutated only while ``_lock`` is held, so a concurrent ``log_event`` and
+    ``reset_audit`` cannot leave a half-installed handler behind.
+    """
+
     def __init__(self) -> None:
         self.handler: logging.Handler | None = None
         self.disabled = False
         self.failures = 0
         self.warned = False
 
+    def reset(self) -> None:
+        handler, self.handler = self.handler, None
+        if handler is not None:
+            audit_logger.removeHandler(handler)
+            handler.close()
+        self.disabled = False
+        self.failures = 0
+        self.warned = False
 
-_state = _State()
+    def install(self, handler: logging.Handler) -> None:
+        audit_logger.addHandler(handler)
+        self.handler = handler
+
+    def note_write_ok(self) -> None:
+        self.failures = 0
+
+    def note_write_failure(self) -> bool:
+        """Count one failed write; True when the one-time warning is due.
+
+        The stream switches itself off after ``_FAILURES_BEFORE_DISABLE``
+        failures in a row: a sink that is gone stays gone, and calling it
+        forever would cost the agent a syscall per event.
+        """
+        self.failures += 1
+        due = not self.warned
+        self.warned = True
+        if self.failures >= _FAILURES_BEFORE_DISABLE:
+            self.disabled = True
+        return due
+
+
+_state = _AuditState()
 _lock = threading.Lock()
 
 
@@ -82,7 +146,7 @@ class _AuditHandler(logging.Handler):
 
 def audit_enabled() -> bool:
     """Read the switch on every call so a late ``.env`` load still counts."""
-    return os.getenv("CORECODER_AUDIT", "").strip().lower() in _TRUTHY
+    return truthy(os.getenv("CORECODER_AUDIT"))
 
 
 def _default_audit_path() -> Path:
@@ -101,48 +165,40 @@ def _parse_level(value: str) -> int:
     return level if isinstance(level, int) else logging.INFO
 
 
+def _newest_files(target: Path) -> list[Path]:
+    """Every file matching ``target``'s pattern, newest first."""
+    candidates = [p for p in target.parent.glob(target.name) if p.is_file()]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:  # a locked old log is not worth failing on
+        pass
+
+
 def prune_old_logs(pattern, keep: int = 10, skip: Path | None = None) -> None:
     """Keep the newest ``keep`` files matching ``pattern``, never deleting
     ``skip`` (the file this process just opened). Errors are best-effort."""
     try:
-        target = Path(pattern)
-        candidates = [p for p in target.parent.glob(target.name) if p.is_file()]
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         skip_resolved = skip.resolve() if skip is not None else None
-        for old in candidates[keep:]:
-            if skip_resolved is not None and old.resolve() == skip_resolved:
-                continue
-            try:
-                old.unlink()
-            except OSError:  # a locked old log is not worth failing on
-                pass
+        for old in _newest_files(Path(pattern))[keep:]:
+            if skip_resolved is None or old.resolve() != skip_resolved:
+                _unlink_quietly(old)
     except Exception:  # noqa: BLE001, S110 - retention must never break startup
         pass
-
-
-def _reset_locked() -> None:
-    if _state.handler is not None:
-        audit_logger.removeHandler(_state.handler)
-        _state.handler.close()
-    _state.handler = None
-    _state.disabled = False
-    _state.failures = 0
-    _state.warned = False
 
 
 def reset_audit() -> None:
     """Drop the configured sink and forget its failure state (tests, reconfig)."""
     with _lock:
-        _reset_locked()
+        _state.reset()
 
 
-def _build_handler(stream=None, file=None) -> logging.Handler:
-    if stream is not None:
-        return _AuditHandler(stream=stream)
-
-    if os.getenv("CORECODER_AUDIT_STREAM", "").strip().lower() == "stderr":
-        return _AuditHandler(stream=sys.stderr)
-
+def _open_audit_file(file=None) -> logging.Handler:
+    """Open this process's audit file, rotating an oversized one first."""
     explicit = file if file is not None else os.getenv("CORECODER_AUDIT_FILE")
     path = Path(explicit) if explicit else _default_audit_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,25 +215,37 @@ def _build_handler(stream=None, file=None) -> logging.Handler:
     return _AuditHandler(fd=fd)
 
 
+def _build_handler(stream=None, file=None) -> logging.Handler:
+    """Pick the sink: explicit stream, opted-in stderr, then a file."""
+    if stream is not None:
+        return _AuditHandler(stream=stream)
+    if os.getenv("CORECODER_AUDIT_STREAM", "").strip().lower() == "stderr":
+        return _AuditHandler(stream=sys.stderr)
+    return _open_audit_file(file)
+
+
+def _install_sink(stream=None, file=None, level=None) -> None:
+    """Build the configured sink, attach it to the audit logger, keep it."""
+    handler = _build_handler(stream=stream, file=file)
+    configured = level if level is not None else os.getenv("CORECODER_AUDIT_LEVEL", "INFO")
+    handler.setLevel(_parse_level(configured))
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler._cc_audit = True
+    _state.install(handler)
+
+
 def configure_audit(stream=None, file=None, level=None) -> None:
     """Install the audit sink. Safe to call repeatedly; never raises."""
+    error_type = None
     with _lock:
-        _reset_locked()
+        _state.reset()
         try:
-            handler = _build_handler(stream=stream, file=file)
+            _install_sink(stream=stream, file=file, level=level)
         except Exception as e:  # noqa: BLE001 - audit is optional
             _state.disabled = True
-            try:
-                _general.warning("event=audit_disabled error_type=%s", type(e).__name__)
-            except Exception:  # noqa: BLE001, S110 - the warning is best-effort
-                pass
-            return
-        configured = level if level is not None else os.getenv("CORECODER_AUDIT_LEVEL", "INFO")
-        handler.setLevel(_parse_level(configured))
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        handler._cc_audit = True
-        audit_logger.addHandler(handler)
-        _state.handler = handler
+            error_type = type(e).__name__
+    if error_type is not None:
+        _warn("event=audit_disabled error_type=%s", error_type)
 
 
 def _quote(value: str) -> str:
@@ -205,20 +273,48 @@ def _trace_context() -> dict:
     try:
         from .tracing import current_trace_context
         return current_trace_context() or {}
-    except Exception:  # noqa: BLE001, S110 - the line matters more than the join
+    except Exception:  # noqa: BLE001 - the line matters more than the join
         return {}
 
 
+def _active_handler() -> logging.Handler | None:
+    """The installed sink, installing the default one on first use.
+
+    ``None`` means "drop this line": audit is switched off, or the last
+    attempt to configure a sink failed.
+    """
+    if not audit_enabled() or _state.disabled:
+        return None
+    handler = _state.handler
+    if handler is None:
+        configure_audit()
+        handler = _state.handler
+    return None if _state.disabled else handler
+
+
 def _write_failed(exc: BaseException) -> None:
-    _state.failures += 1
-    if not _state.warned:
-        _state.warned = True
-        try:
-            _general.warning("event=audit_write_failed error_type=%s", type(exc).__name__)
-        except Exception:  # noqa: BLE001, S110 - the warning is best-effort
-            pass
-    if _state.failures >= 3:
-        _state.disabled = True
+    with _lock:
+        due = _state.note_write_failure()
+    if due:
+        _warn("event=audit_write_failed error_type=%s", type(exc).__name__)
+
+
+def _emit(handler: logging.Handler, event: str, level: int, fields: dict) -> None:
+    """Hand one record to the sink; a broken sink is not an agent error."""
+    # same names as the trace record, so the two files join on them; a
+    # caller may set them explicitly and win over the ambient span
+    context = _trace_context()
+    if context:
+        fields = {**context, **fields}
+    record = logging.LogRecord(
+        "corecoder.audit", level, __file__, 0, _format(event, fields), None, None)
+    try:
+        handler.handle(record)
+    except Exception as e:  # noqa: BLE001 - a broken sink is not an agent error
+        _write_failed(e)
+    else:
+        with _lock:
+            _state.note_write_ok()
 
 
 def log_event(event: str, level: int = logging.INFO, **fields) -> None:
@@ -229,43 +325,16 @@ def log_event(event: str, level: int = logging.INFO, **fields) -> None:
     ``span_id``); that is what lets a reader find the matching trace record.
     """
     try:
-        if not audit_enabled() or _state.disabled:
+        handler = _active_handler()
+        if handler is None or level < handler.level:
             return
-        handler = _state.handler
-        if handler is None:
-            configure_audit()
-            handler = _state.handler
-            if handler is None or _state.disabled:
-                return
-        if level < handler.level:
-            return
-        # same names as the trace record, so the two files join on them; a
-        # caller may set them explicitly and win over the ambient span
-        context = _trace_context()
-        if context:
-            fields = {**context, **fields}
-        record = logging.LogRecord(
-            "corecoder.audit", level, __file__, 0, _format(event, fields), None, None)
-        try:
-            handler.handle(record)
-        except Exception as e:  # noqa: BLE001 - a broken sink is not an agent error
-            _write_failed(e)
-        else:
-            _state.failures = 0
+        _emit(handler, event, level, fields)
     except Exception:  # noqa: BLE001, S110 - log_event runs in finally blocks
         pass
 
 
-def configure_logging() -> None:
-    """Configure the general ``corecoder`` logger (hooks, MCP, degradations).
-    Independent of the audit switch: audit INFO events never depend on this."""
-    level = _parse_level(os.getenv("CORECODER_LOG_LEVEL", "WARNING"))
-    logger = _general
-    for handler in list(logger.handlers):
-        if getattr(handler, "_cc_general", False):
-            logger.removeHandler(handler)
-            handler.close()
-
+def _general_handler(level: int) -> logging.Handler:
+    """A file sink when ``CORECODER_LOG_FILE`` is set, otherwise stderr."""
     target = os.getenv("CORECODER_LOG_FILE")
     handler: logging.Handler
     if target:
@@ -280,5 +349,17 @@ def configure_logging() -> None:
         logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     handler.setLevel(level)
     handler._cc_general = True
-    logger.addHandler(handler)
+    return handler
+
+
+def configure_logging() -> None:
+    """Configure the general ``corecoder`` logger (hooks, MCP, degradations).
+    Independent of the audit switch: audit INFO events never depend on this."""
+    level = _parse_level(os.getenv("CORECODER_LOG_LEVEL", "WARNING"))
+    logger = _general
+    for handler in list(logger.handlers):
+        if getattr(handler, "_cc_general", False):
+            logger.removeHandler(handler)
+            handler.close()
+    logger.addHandler(_general_handler(level))
     logger.setLevel(level)
