@@ -18,7 +18,6 @@ venv/
 .idea/
 .playwright-mcp/
 uv.lock
-optimize/
 tmp_*.txt
 # bug-repro scripts waiting on their fix; add with `git add -f` once fixed
 examples/m1_*.py
