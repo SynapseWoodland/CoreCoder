@@ -378,6 +378,10 @@ class _LangfuseSpan(_BaseSpan):
 
     def _close(self) -> None:
         self._apply(self.attrs)
+        if self.error is not None:
+            # `level` is how the trace list separates a failed step from an
+            # ordinary one; leaving it at DEFAULT makes a broken run invisible
+            self.observation.update(level="ERROR", status_message=self.error)
         self.context.__exit__(None, None, None)
         # the attribute context was opened before the observation, so it must
         # be closed after it: OTEL contexts unhook in reverse order

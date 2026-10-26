@@ -668,3 +668,31 @@ def test_content_capture_switch_accepts_the_shared_spellings(monkeypatch, tmp_pa
     monkeypatch.setenv("CORECODER_TRACE_CONTENT", "0")
     assert create_tracer("jsonl", file=str(tmp_path / "plain.jsonl"),
                          capture_content=True).capture_content is True
+
+
+# ─── 11. the four gaps that were still open before dogfood ─────────────────
+# B1 (error level), B4 (the run's answer at trace level), B5 (sub-agent
+# tracing), B8 (tags / user id). Each one is a field the backend already
+# accepts but corecoder never handed over.
+
+def test_langfuse_error_is_reported_at_error_level():
+    """A failed step must not read as DEFAULT in the trace list (B1).
+
+    `_BaseSpan.end` keeps the error text and the JSONL record writes it, so the
+    Langfuse adapter was the only backend dropping information it had already
+    been given - and the list view is where a failure is supposed to be found.
+    """
+    client = FakeLangfuse()
+    tracer = LangfuseTracer(client=client)
+    span = tracer.start("tool.spy")
+    span.end(error="RuntimeError: boom")
+
+    updates = client.observations[0].updates
+    assert any(u.get("level") == "ERROR" for u in updates)
+    assert any(u.get("status_message") == "RuntimeError: boom" for u in updates)
+
+    quiet = FakeLangfuse()
+    clean = LangfuseTracer(client=quiet)
+    clean.start("tool.spy").end()
+    assert all("level" not in u for u in quiet.observations[0].updates), \
+        "a run that worked must not be marked up"
