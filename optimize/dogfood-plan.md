@@ -1,6 +1,6 @@
 # Dogfood 计划：先让可观测性可读，再决定优化什么
 
-- 文档版本：v1.7（2026-10-26）
+- 文档版本：v1.8（2026-10-26）
 - 读者：本仓库维护者（未参与前序讨论，需要照做即可执行）
 - 定位：把「先建评测集，还是先做作者留下的优化项」的讨论结论，落成有依赖顺序、有验收标准的执行计划
 - 关联文档：`optimize/agent-loop-must-optimize.md`（循环缺陷分析）。本文不重复那部分内容，也不复核已实施的 M1–M4
@@ -9,7 +9,8 @@
 > 本文只回答三件事：现在该做什么、按什么顺序、做完怎么验收。
 >
 > **数字声明**：文中统计值均为实测后写下的那一次读数（主体 v1.2，3.1 与 3.2 的缺陷表 v1.5 重测，
-> 0B 的 B1/B4/B5/B7/B8 与第 9、11 项在 v1.6 逐条对照代码复核过）。
+> 0B 的 B1/B4/B5/B7/B8 与第 9、11 项在 v1.6 逐条对照代码复核过，B1/B4/B5/B8 与 C2 在 v1.8 落地并按
+> 修复后的实测改写）。
 > 观测数据是活的，会随运行次数增长，也会被保留策略裁掉（见 3.3），复核请直接跑附录 A 的命令，
 > 不要拿本文的数字当基线。本文不含代码行号，
 > 引用一律用符号（函数名、文件名、常量名）。
@@ -38,6 +39,12 @@
 >
 > **v1.7 增量**：新增阶段 0D —— 把 audit 的保留上限从写死的 10 做成配置项 `CORECODER_AUDIT_KEEP`。
 > 阶段 1 因此**不再需要任何搬文件或改路径的归档动作**；3.1 与 3.3 按新口径重写。
+>
+> **v1.8 增量**：0B 与 0C 至此收口。B1、B4、B5、B8 与 C2 五条一起落地（`corecoder/tracing.py`、
+> `corecoder/agent.py`、`corecoder/tools/agent.py` 与 `tests/`），0B 只剩 B7，0C 三条全部完成。
+> **两条先前的判断被实测推翻**，改写处都留了原因：C2 落地走了与原文相反的方向（见 0C），
+> B5 的症状与 3.4 原记的恰好相反（见 0B）。
+> 另带回一条新限制：子 agent 现在与父同会话，一个用户回合可能留下两行 `run_summary`（见 3.3 第 4 条）。
 
 ## 1. 结论
 
@@ -116,7 +123,8 @@ L2 的验收器最便宜的形态是**用项目自己的测试当裁判**：给 
 
 历史本来就不靠 audit 留：同一批运行在 Langfuse 里 **205 → 2814 条一条没少**（自托管库不裁），
 而 audit 被 `keep=10` 从 809652 字节裁到 575763。所以 audit 的定位是「最近现场 + 一份免费的
-纯文本副本」；要回看完整现场得查 trace，而那要先修好 B1/C2/B4。
+纯文本副本」；要回看完整现场得查 trace，而这条路**v1.8 起通了**（B1/C2/B4 已落地，拿审计行的
+`trace_id` 能直接命中一条带 `level`/`tags`/`output` 的 trace）。
 
 trace 侧现在只能看 Langfuse：`CORECODER_TRACE=langfuse` 之后 `traces.*.jsonl` 不再新增（最新一批仍是
 10-25 的读数），而 Langfuse 里的污染比 audit 更重——最近的抽样里连 `tool.writer`、`tool.boom`、
@@ -171,8 +179,16 @@ trace 侧现在只能看 Langfuse：`CORECODER_TRACE=langfuse` 之后 `traces.*.
 3. **trace 与 audit 是两套开关**。`CORECODER_TRACE=langfuse` 时失败会退到 `NullTracer`（不降级写文件），
    所以「有 audit 无 trace」是正常状态，不要当成丢数据。重构后多了一条：tracing 关时
    `current_trace_context()` 返回 `None`，audit 行就**不带** `trace_id`（实测 2780 行里 219 行如此）。
+4. **一个用户回合可能对应两行 `run_summary`**（v1.8 随 B5 带回）。`AgentTool.execute` 现在把父的
+   `session_id` 传给子 agent，于是子 agent 自己的 `run_summary` 也落在同一个会话里。按会话
+   数「跑了几次」不再等于「用户问了几句」。更要当心的是一处**结构性重复计**：子 agent 与父共用
+   同一个 `llm` 对象，而 `run_summary` 的 `cost_usd` 是 `_cost_delta(run.cost_before, 当前累计)`，
+   子那行的增量是父那行增量的**子集**——把某会话的 `run_summary` 按行相加，成本会高于真实账单。
+   没有子 agent 时不受影响（只有一个父 delta），所以现在读数为 0 差异；**按会话算成本请改用
+   `llm_call` 行**，它一次模型调用一行，结构上不会重。要不要给子 agent 的运行汇总打个标记
+   （如 `sub=true`）以便按行剔除，等阶段 1 真出现带子 agent 的成本统计再定。
 
-### 3.4 Langfuse 侧实测（v1.2 重测）
+### 3.4 Langfuse 侧实测（主体 v1.2；标 ✓ 的四行为 v1.8 修复后实测）
 
 审计流的问题在 3.2 已经列过，trace 流是另一套账。下面是直接查本地 Langfuse
 （REST `/api/public/traces`、`/api/public/observations`、`/api/public/scores`）得到的读数，不是推测：
@@ -183,16 +199,15 @@ trace 侧现在只能看 Langfuse：`CORECODER_TRACE=langfuse` 之后 `traces.*.
 | 名称分布 | 最新 1000 条里 `agent.chat` 848、`tool.*` 152 | **15.2% 的 trace 其实是一个工具 span 自己**（见 3.5 的 N3） |
 | observation 类型 | GENERATION 4006 / TOOL 2438 / SPAN 2336 / EVENT 753 / AGENT 0 | span 形状已对；AGENT 为 0 → 第 9 项 |
 | `environment` | 抽样 1000 条全为 `default`（历史数据） | **v1.3 已修**：最新一条真实运行实测 `environment=dogfood`，旧数据仍集中在 `default` |
-| `tags` / `userId` | 全空 | SDK 侧通道已经就绪（`propagate_attributes`），没人喂值 → 新增 B8 |
-| `scores` | 0 | B7 未做；SDK 已提供 `observation.score()` |
-| observation `level` | 全库只有 2 条 `ERROR`，都是探针自己写的 | CoreCoder 至今没产出过一条 ERROR → B1 未修 |
-| `trace.output` | 848 条 `agent.chat` **全部 `None`**（v1.6 复核：最新真实运行仍 `None`）；轮内 `llm.round` 有正文 | B4 未修 |
+| `tags` / `userId` | ✓ 新运行 `tags=['build:probe']`、`userId=synapse` | **v1.8 已修（B8）**：`Agent._labels` 取值随 root 传；历史仍空 |
+| `scores` | 0 | B7 未做；SDK 已提供 `observation.score()` / `score_trace()`（v1.8 实测确认签名） |
+| observation `level` | ✓ 失败运行的 `tool.boom` 与 root 都 `level=ERROR`，带 `statusMessage` | **v1.8 已修（B1）**；历史仍全 `DEFAULT` |
+| `trace.output` | ✓ 正常运行有值；异常上抛的仍 `None`，由 `level=ERROR` 说明 | **v1.8 已修（B4）**：`chat()` 返回值交给 root；正文按轮仍在 `llm.round` |
 | `totalCost` | 1000 抽样里 13 条非零 | **已改善**：原生 `cost_details` 已写（非零的都是价目表里有价的模型）；`mimo` 仍空 → B3 只剩价目表条目 |
-| session | `agent.chat` 848 条都有 `sessionId`；152 条孤儿全空 | 会话维度可用；孤儿连 session 都继承不到 |
+| session | `agent.chat` 848 条都有 `sessionId`；152 条孤儿全空 | 会话维度可用（v1.8 实测：子 agent 与父同会话，不再是第二个会话） |
 
 结论：**span 结构与原生字段都已到位**（generation / tool / event 三种形状都落库，usage 与 cost 走原生通道），
-缺的还是那两样——分类维度与失败标记；而且重构新增了一个更基本的问题：audit 与 trace 的 join key 对
-Langfuse 无效（3.5 的 N2）。
+分类维度与失败标记在 v1.8 补上，只剩 B7（scores）；曾经更基本的 join key 问题（3.5 的 N2）也已闭合。
 
 ### 3.5 重构带回的四个问题（v1.2 新增）
 
@@ -210,16 +225,18 @@ Langfuse 无效（3.5 的 N2）。
   为什么测试没发现它：旧用例只断言 `SystemExit` 能传播与历史被回填（`tests/test_agent_loop_hardening.py`
   的 `exiter` 用例），不断言标签。
 
-**N2　audit 的 `trace_id` / `span_id` 在 Langfuse 里查不到**
+**N2　audit 的 `trace_id` / `span_id` 在 Langfuse 里查不到**——**v1.8 已修（方向与原文相反，见 0C 的 C2）**
 
 - 证据：audit 里共 531 个 `trace_id`，与 Langfuse 最新 100 条 trace id **交集为 0**；拿 audit 的 id 去查
   `/api/public/traces/<id>` 一律 404。
 - 原因：`_SpanTracer._origin` 用 `uuid.uuid4().hex` 自造 trace id，Langfuse 用 OTel 生成的 id，两边从不对齐。
   `tracing.py` 与 `audit.py` 的模块 docstring 都写着「一行和它的 trace 记录可以 join」，这句话对
   jsonl 成立、对 langfuse 不成立。
-- 可修的点：SDK 的 `start_as_current_observation(trace_context=...)` 接受外部 trace id
-  （`TraceContext` 是 `{trace_id, parent_span_id?}`），而我们的 id 正好是 32 位小写 hex，合法。
-  见 0C 的 C2。
+- 修复前记在这里的「可修的点」（`start_as_current_observation(trace_context=...)`）**不是最终落地的路子**：
+  实测 SDK 的 observation **公开** `trace_id` 与 `id` 两个属性，所以不需要 `getattr` 进 OTel 内部，
+  也不必让 SDK 接受我们的 id——反过来采用后端的 id 更便宜。v1.8 复算：拿审计行的 `trace_id` 查
+  `/api/public/traces/<id>` 返回 200，且 `span_id` 与 observation 的 `id` 同为 16 位 hex（自造 id 是 32 位，
+  长度差本身就是采用成功的信号）。
 
 **N3　没有 run 上下文时，工具 span 自己成了一条顶层 trace**
 
@@ -305,14 +322,14 @@ def _observability_isolated(monkeypatch, tmp_path):
 
 | # | 问题 | 落点（符号） | 改法 | 验收 / v1.2 复验状态 |
 |---|---|---|---|---|
-| B1 | 失败无标记 | `_LangfuseSpan._close` | `update(level="ERROR", status_message=self.error)` | **仍未修**：`error` 连 metadata 都没进 |
+| B1 | 失败无标记 | `_LangfuseSpan._close` | `update(level="ERROR", status_message=self.error)` | **v1.8 已修**：span 与 root 都标 `ERROR` |
 | B2 | 测试混池 | `.env` | 设 `LANGFUSE_TRACING_ENVIRONMENT=dogfood` | **v1.3 已修**：最新真实运行实测 `environment=dogfood` |
 | B3 | 成本恒 0 | 同 0-3 | 补 `~/.corecoder/pricing.json` | **v1.5 已修**：价目表条目已补，真实运行实测 `cost_usd=0.001515` |
-| B4 | trace 层无答案 | `_finish_run` | 给 root 记 `output`（即 `chat()` 的返回值） | **仍未修**：root 与 trace 层均空；正文按轮在 `llm.round` 上 |
-| B5 | 子 agent 断链 | `AgentTool.execute` | 子 `Agent(...)` 传 `tracer` 与 `session_id` | **仍未修**：两个参数都还缺 |
-| B6 | 重试只在 audit | `LLM.chat` | 加事件回调，`Agent` 传入 span 的 `event` | **已降级**：真实跑时已有 join key，只差 trace 里的 event |
-| B7 | 没有 score | `Span`、`_LangfuseSpan` | root 结束时按 `outcome` 打分 | **仍未修**：scores 总量 0；SDK 已提供 `observation.score()` |
-| B8 | tags / userId 全空 | `RunTrace.start_run` | 把运行来源以 `tags=`（或 `user_id=`）传进去 | **新增**：`_trace_attributes` 已能透传，只是没人喂值 |
+| B4 | trace 层无答案 | `_finish_run` | 给 root 记 `output`（即 `chat()` 的返回值） | **v1.8 已修**：`_RunStats.answer` 写进 root，实测有值 |
+| B5 | 子 agent 无视注入的 tracer | `AgentTool.execute` | 子 `Agent(...)` 传 `tracer` 与 `session_id` | **v1.8 已修**：两行参数；症状原记反了，见下方约束 |
+| B6 | 重试只在 audit | `LLM.chat` | 加事件回调，`Agent` 传入 span 的 `event` | **已降级**：已有 join key（v1.8 后两边同一个 id），只差 trace 里的 event |
+| B7 | 没有 score | `Span`、`_LangfuseSpan` | root 结束时按 `outcome` 打分 | **未修（v1.8 推后）**：scores 仍 0；`score_trace()` 实测可用，缺「拿什么判好坏」 |
+| B8 | tags / userId 全空 | `Agent._labels` → `start_run` | 以 tags/user_id 传入 | **v1.8 已修**：tag 带 `build:` 前缀；新增 `CORECODER_USER` |
 
 八条实施约束，都是实测踩出来的，不要绕过：
 
@@ -327,6 +344,8 @@ def _observability_isolated(monkeypatch, tmp_path):
   `fields["error"]`（v1.5 随缺陷 2 接上的），`RunTrace.tool_failed` 也早就在写 `span.end(error=...)`，
   两者都被 `_BaseSpan.end` 收进 `self.error`。所以 B1 剩下的不是数据流改造，是 `_LangfuseSpan._close`
   里加两行：`self.error` 非空时 `update(level="ERROR", status_message=self.error)`。
+  **v1.8 已按此落地**，一字未改：`_close` 在 `_apply(self.attrs)` 之后补一次 `update`，
+  不往 `_apply` 里塞（那样 `level` 会被当成 metadata）。成功的路径不设 `level`，免把正常运行标高。
 - **B2 的环境变量必须在 `get_client()` 之前设置**。`create_tracer` 里的 `LangfuseTracer`
   首次构造时才调 `get_client()`，所以 `.env`（经 `Config._load_dotenv`）与 conftest 的
   `monkeypatch.setenv` 都赶得上；同一进程内第二次修改就不再生效。
@@ -347,34 +366,60 @@ def _observability_isolated(monkeypatch, tmp_path):
   改法：把返回值交给一个局部变量，`_finish_run` 用它写 root 的 `output`（只在 `capture_content`
   为真时写，与 `capture_request` 一致）。重构后这一步反而容易了：`chat()` 现在只有一处
   `return self._run_rounds(...)`，接住它比在多个中途 return 前赋值干净。
-- **B5 不能只传 tracer**：`session_id` 也得传，否则子 agent 在 Sessions 视图里是孤儿。
-  另外子 agent 的 root 名与父 agent 同为 `agent.chat`，建议顺手传一个可区分的名字（如 `agent.sub`）。
-  重构后这句话多一层含义：子 agent 拿到的是 `create_tracer()` 新建的 tracer，自己的 span 栈是空的，
-  所以 `_origin` 必然自造一个新 trace id——C2 落地后这个 id 会直接变成 Langfuse 的 trace id，
-  断链就从「隐式」变成「显式」。B5 与 C2 要一起改，不要分两次。
+  **v1.8 已落地，但本节上面那句「三个兜底返回值」写错了，修正如下**：`chat()` 只有**两个**正常
+  返回——`resp.content` 与 `(reached maximum tool-call rounds)`；`TruncatedOutput` 是 `raise`，
+  `[interrupted]` 是往历史里回填工具回复、不构成 `chat()` 的返回值（见 AGENTS.md 1.1 那三条兜底分支
+  的形状）。所以落地面是两个返回都记（`_RunStats.answer` 只在正常返回时赋值），`max_rounds`
+  那条占位文本现在与用户看到的一致；抛异常的运行 `trace.output` 保为 `None`，由 B1 的
+  `level=ERROR` + `statusMessage` 说清原因。它天然挂在 `CORECODER_TRACE_CONTENT` 下：关掉后
+  `_filter` 剥掉 `output`，跟本轮没记一样。没有把正文也放进 `run_summary`：审计行按设计只记
+  元数据（见 3.3 第 2 条），而答案可以无限长，进审计行等于绕过 `_govern_result` 的钳制。
+- **B5 不能只传 tracer**（v1.8 已修：`tracer=parent.tracer` 与 `session_id=parent.session_id` 两行一起加）。
+  先把症状改对：本节原记「子 agent 断链／无 trace」，**实测是反的**——子 agent 一直有 trace，
+  而且在 Langfuse 里确实挂在父 trace 下面（OTel 上下文自己就传过去了）。真问题有三个，
+  都不是「看不到」：①它自己调 `create_tracer()`，**无视调用方注入的 tracer**——实测父用 jsonl 后端时，
+  子 agent 把整棵树传进了 Langfuse，众目睽睽下多一条谁都没要的孤儿 trace；②jsonl 后端下父子是
+  两棵断开的树；③子 agent 自造 session id，一次提问在 Sessions 视图里变成两个会话。传了这两个
+  参数三条一起消失：实测子 `agent.chat` 的 `parentObservationId` 正是父的 `tool.agent`，两条运行同一个
+  `sessionId`，且不再多出一条 trace。原本写的「B5 与 C2 要一起改」成立了，两边确实同一轮落地。
+  本轮没修的连带事项：子 agent 的 root 名仍与父同为 `agent.chat`（建议 `agent.sub`），与第 9 项的
+  `as_type` 一起规划；共享 session 后 `run_summary` 每回合可能两行，成本子集问题另见 3.3 第 4 条。
 - **B6 走回调，不改签名**：`llm_retry` 与 `provider_fallback` 都在 `LLM.chat` / `LLM._open_stream` 内部产生，
   `Agent` 拿不到。与其让 `LLM` 认识 tracer，不如给它一个可选的事件回调。
   v1.2 重新定级：这两类审计行现在已经带上 ambient span 的 `trace_id`/`span_id`（已用 jsonl 后端
   离线实验证实），归因问题已解决，剩下的只是「Langfuse 时间线上看不到重试」。排到 B7 之后。
   （注意：测试里那 24 条 `llm_retry` 全是零 join key，因为它们直接驱动 `LLM`/`LiteLLM`，根本没有 span。）
-- **B7 不能用 `self.trace_id` 去 `create_score`**：`_BaseSpan.trace_id` 是 corecoder 自己生成的 uuid，
-  在 C2 之前与 Langfuse 的 trace id 不是同一个值。现成的两条安全路径：用 root observation 自己的
-  `observation.score(name=, value=)`（不涉 id），或用 `score_current_trace` 且必须在 root span
-  上下文未退出时调用，写进 `_LangfuseSpan._close` 最稳。
+- **B7 不能用 `self.trace_id` 去 `create_score`**——**前提已在 v1.8 消失**：`_BaseSpan.trace_id` 是 corecoder
+  自己生成的 uuid、与 Langfuse 不同值这件事，在 C2 落地后不再成立（Langfuse 后端下 `self.trace_id`
+  **就是**后端的 trace id），所以 `create_score(traceId=...)` 这条路现在可用了。保留的技术事实：
+  更稳的两条不涉 id——root observation 自己的 `observation.score(name=, value=)`，或
+  `score_current_trace`（必须在 root span 上下文未退出时调，写进 `_LangfuseSpan._close` 最稳）。
+  v1.8 实测 SDK 5.0.4：`update()` 的签名公开带 `level` 与 `status_message`，`score` /
+  `score_trace` / `create_score` / `create_trace_id` / `get_current_trace_id` 全在公开面上；
+  推后它的理由不是 API，是**没有判断来源**：`outcome=answer` 不等于答对了，凭 `outcome` 打分
+  只会造出一堆自我肯定的 score，反而把 B7 想做的评价面板先玩坏。
 - **B8 的 tags 创建后不可变**：Langfuse 的 trace tags 是创建时定死的，后补无效；必须随 root span 一起传。
   代码里已经有了这个限制的依据：`LangfuseTracer._open_trace_attributes` 在 `origin.parent` 非空时
   直接返回 `None`，子 span 上的 `tags`/`user_id` 只会落成普通 metadata。
-  `RunTrace.start_run` 现在是唯一没把 `tags`/`user_id` 往下传的环节，补一个可选参数即可。
-  v1.6 核对：签名实测为 `start_run(*, model, session_id, version, max_rounds)`，确实没有这两个形参；
-  同次核对一条最新真实运行：`sessionId` 有值（会话维度可用）、`userId=None`、`tags=[]`、`scores=0`，
-  所以 B7 与 B8 都仍然是「通道就绪、没人喂值」。
+  `RunTrace.start_run` 曾是唯一没把 `tags`/`user_id` 往下传的环节（v1.6 核对签名确实没有这两个形参）。
+  **v1.8 落地形态与两条原写法不同，理由记在这**：①取值放在 `Agent._labels`（`chat()` 调 `start_run` 时
+  `**` 展开），而不是在 `tracing.py` 里 `os.getenv`——附录 B 早就警告过拆两个模块各读一半；
+  `Agent._log_run_summary` 已经在读 `CORECODER_BUILD`，标签归位同一个模块才不会出现「改了 audit
+  忘了 trace」；`RunTrace.start_run` 只多两个透传形参（空值不往 `tracer.start` 里塞，免为 jsonl
+  记录添 `null` 噪声）。②tag 带前缀 `build:`，因为 Langfuse 的 tag 列表里一个光溜的 `dogfood`
+  与任意其他标签不可区分。③新增只读开关 `CORECODER_USER`（不设就是 `userId=None`）：姓名是
+  个人数据，只允许显式提供。**副作用要记住**：conftest 必须同时 `delenv` 这两个变量，否则
+  `.env` 里的 `CORECODER_BUILD=dogfood` 会跟着某次 `Config.from_env()` 进进程环境，使
+  「没打标」那一类断言依赖测试执行顺序（v1.7 在 `CORECODER_AUDIT_KEEP` 上踩过一次同样的坑）。
 
 完成 0B 后，阶段 1 的读数入口从「翻 audit 日志」变成「Langfuse 里按 environment + level + tags 筛」。
+**v1.8 起这句话成立**（只剩 `scores` 那一档还没数据）。
 
 #### 阶段 0C：先修重构带回的三个归因问题（约两小时）
 
 这一组不是「让数据更好筛」，而是「数据在说谎」。C1 优先于整个 B 组，因为它污染的就是
 阶段 1 要读的 `outcome`。三条都带证据编号，细节回 3.5 看，这里只写改法与验收。
+**v1.8：三条全部落地。**
 
 - **C1　`outcome` 把崩溃标成「轮数用尽」**（3.5 的 N1）——**v1.4 已修**
   - 落点：`_RunStats.outcome` 默认值、`Agent.chat` 的 `except`、`_run_rounds` 的耗尽分支
@@ -384,11 +429,21 @@ def _observability_isolated(monkeypatch, tmp_path):
     先失败后通过——把 `agent.py` 临时撤回修复前，它读出 `AssertionError: max_rounds`，即 bug 本身；
     修复后真耗尽仍为 `max_rounds` 且有 `event=max_rounds` 行佐证，抛 `SystemExit` 的那次记为 `error`
     且**没有** `max_rounds` 行；全量 353 passed / 1 skipped，compileall 与 ruff 均绿
-- **C2　audit 的 id 在 Langfuse 里查不到**（3.5 的 N2）
-  - 落点：`LangfuseTracer._open_observation`
-  - 改法：root span 传 `trace_context={"trace_id": origin.trace_id}`；child 不传，
-    靠 OTEL 上下文自动嵌套
-  - 验收：拿 audit 行里的 `trace_id` 能命中 `/api/public/traces/<id>`，不再 404（命令见 A.7）
+- **C2　audit 的 id 在 Langfuse 里查不到**（3.5 的 N2）——**v1.8 已修，但走了与本文相反的方向**
+  - 本文原方案：root span 往 `start_as_current_observation(trace_context={"trace_id": …})` 里塞我们的 id，
+    让 SDK 接受 corecoder 的 id；第 6 节还写过「反过来回写 SDK 的 id 要一路 `getattr` 进 OTel 内部，
+    等于把可观测层做成硬依赖，所以不做」。**那句判断是错的**：实测 SDK 5.0.4 的 observation
+    **公开** `trace_id`（32 位 hex）与 `id`（16 位 hex）两个属性，根本不需要 `getattr` 探内部对象
+  - 落地方案（`_LangfuseSpan.__init__`）：observation 建好后把 `self.trace_id` / `self.span_id` 换成
+    后端公开的那两个值，`current_trace_context()` 一字不改，审计行自动拿到可查 id；SDK 不公开
+    id 时（旧版或替身客户端）保留自造 id，不依赖它存在
+  - 为什么选这个方向：它是**读取已有事实**，原方案是**让另一个系统接受你的 id**——后者要处理
+    id 合法性与 SDK 行为差异，且一旦 SDK 不采纳就会静默失败；前者失败就是回退到自己造 id
+  - 代价（要认）：同一段代码在 jsonl 与 langfuse 两个后端下产生**不同形状的 id 空间**（32 位 vs
+    16 位 span_id），跳后端比对时不能拿 id 字符串直接等；`audit.py` 里「一行和它的 trace 记录可以
+    join」这句 docstring 因此对两个后端都成立
+  - 验收（已跑）：拿审计行的 `trace_id` 命中 `/api/public/traces/<id>` 返回 200（命令见 A.7）；
+    离线用 `tests/test_tracing_langfuse_v5.py` 的两条新用例覆盖（采用后端 id / SDK 不公开展示时回退）
 - **C3　测试直接驱动内部方法造孤儿**（3.5 的 N3）——**v1.3 已随 0-1 落地**
   - 落点：`tests/test_audit.py` 的 `_execute_round` 用法 + 0-1 隔离
   - 改法：靠 0-1 把 trace 关掉；先不改 `RunTrace` 的形状
@@ -446,8 +501,11 @@ C2 选「让 Langfuse 用 corecoder 的 id」，而不是反过来在 span 创�
 | `tokens_in` | 累计输入 token | 涨得比 `tokens_out` 快得多，说明上下文在重复付费 |
 
 这三行读的是 `run_summary`。重构后另有一条捷径：审计行已经带上当时打开的 span 的 id
-（`trace_id`/`span_id`），所以一行 audit 能直接指到一条 trace——但只对 jsonl 后端成立，
-Langfuse 要等 C2（见 3.5 的 N2）。
+（`trace_id`/`span_id`），所以一行 audit 能直接指到一条 trace。v1.8 之前这句只对 jsonl 后端成立；
+**现在两个后端都成立**，Langfuse 侧的 id 已在 C2 里对齐（实测拿审计行的 id 查 REST 返回 200）。
+
+还有一条 v1.8 起要当心的口径：上面三行是按 `run_summary` 读的，而一个用户回合现在可能有两行
+（子 agent 与父同会话、成本增量是父的子集），详见 3.3 第 4 条。
 
 每次「卡住 / 改错 / 让我不耐烦」记一行：**现象 + 它当时调了什么工具 + 当时的 `outcome`**。
 
@@ -525,7 +583,8 @@ self._fixed_prompt_tokens()`，与 `ContextManager.maybe_compress` 一致；v1.2
 实测 latency 0.001s，`duration_ms` 只在 metadata 里。
 
 第 9 项动手时要连带确认：改成 `agent` 类型后，Agent Graph 的节点名取 span 名，
-应与 B5 的子 agent 命名（`agent.sub`）一起规划，不要分两次改。
+应与子 agent 的命名（`agent.sub`）一起规划，不要分两次改。B5 已在 v1.8 落地（tracer 与会话归并），
+**命名仍未做**：父与子的 root span 现在同名 `agent.chat`，只在树形状上可区分。
 第 11 项不是 bug：`_BaseSpan.retime` 的 docstring 已经写明「自己计时后端不受影响」，
 要改就得往 SDK 的 OTel span 里写时间戳，代价跟收益不匹配，先挂着。
 
@@ -538,9 +597,10 @@ self._fixed_prompt_tokens()`，与 `ContextManager.maybe_compress` 一致；v1.2
 - **不追 L3 公开 benchmark**：需要容器环境与预算，与当前「单进程 + 无沙箱」的形态不匹配。
 - **不为可观测性接第二套后端**：jsonl 与 langfuse 已经两套，再加只会让「数据在哪」更难回答。
 - **现在不做第 5 节那三条**：触发条件未出现，改动面却不小（B1–B8 加 C1–C3 已经占满阶段 0 的预算）。
-- **不给 audit 再造一套 id**：join 的方向是「让 Langfuse 接受 corecoder 的 trace id」（C2），
-  而不是反过来在 span 创建后把 SDK 的 id 回写审计行——后者要一路 `getattr` 进 OTel 内部，
-  等于把一个可选的观测层做成硬依赖。
+- **不给 audit 再造一套 id**：join 只靠一个 id 空间。v1.8 落地的方向是「**corecoder 采用后端的
+  id**」（`_LangfuseSpan` 读 SDK 公开的 `trace_id` / `id`），而不是为审计行另生一套号。
+  本文先前写的方向止于「不让 SDK 接受我们的 id」（C2 原方案），当时把「回写后端 id」夸成了
+  要 `getattr` 进 OTel 内部的硬依赖——实测那两个属性是公开的，所以取了便宜的那条。
 - **阶段 0 不给 `RunTrace` 加「无 root 就不开 span」的判据**：N3 那 152 条孤儿全部来自测试直调
   内部方法，生产路径没有证据。先靠 0-1 把 trace 关掉让噪音归零；阶段 1 若真出现孤儿，
   再决定是拦下来还是报警——那时才有资格说「加一层防护」。
@@ -557,6 +617,7 @@ self._fixed_prompt_tokens()`，与 `ContextManager.maybe_compress` 一致；v1.2
 | v1.5 | 2026-10-26 | 缺陷 2（`error_type`）与 0-3 / B3（价目表）落地，阶段 0A 四条至此全部完成 |
 | v1.6 | 2026-10-26 | `corecoder/` 零改动；按重构后的代码逐条复核待做项，改写 B4、补 B1/B8/3.3 |
 | v1.7 | 2026-10-26 | 0D 落地：`CORECODER_AUDIT_KEEP` 使保留上限可配；3.1 与 3.3 重写 |
+| v1.8 | 2026-10-26 | B1/B4/B5/B8 与 C2 五条一起落地，0B 只剩 B7；推翻并改写了两条旧判断 |
 
 v1.1：3.4 加了 Langfuse 侧读数；阶段 0 拆成 0A/0B，增 B1–B7 与六条约束；第 5 节只留第 9–10 项
 （第 8 项当时判定已修复）；0-1 补上 langfuse 后端的隔离盲点。
@@ -631,6 +692,27 @@ v1.7：
   这个顺序不该修，修了 demo 会继承 `CORECODER_TRACE=langfuse` 并往真实 Langfuse 写
 - 阶段 0 至此只剩 0B（B1/B4/B5/B7/B8）与 0C 的 C2；三命令 354 passed / 1 skipped、compileall OK、ruff 绿
 
+v1.8：
+
+- 五条一起落地，改动四处：`corecoder/tracing.py`（`_LangfuseSpan.__init__` 采用后端 id、`_close` 写
+  `level`/`status_message`、`RunTrace.start_run` 多两个透传形参）、`corecoder/agent.py`
+  （`_RunStats.answer`、`Agent._labels`、`_finish_run` 写 root `output`）、`corecoder/tools/agent.py`
+  （子 agent 继承 `tracer` 与 `session_id`）、`tests/`（conftest 隔离两个新变量 + 十条新用例）。
+  循环形状与三条兜底分支未动（AGENTS.md 1.1），工具集计数未动（1.2）
+- **推翻两条自己先前的判断**，都写清了证据：C2 的「回写后端 id 要 `getattr` 进 OTel 内部，所以不做」
+  是错的（那两个属性公开）；B5 的「子 agent 断链」症状记反了（它有 trace 且能嵌套，真问题是无视
+  注入的 tracer）。另修正一条写错的口径：`chat()` 只有两个正常返回，`[interrupted]` 不是返回值
+- **B8 按附录 B 的警告选了调用方取值**（`Agent._labels`）而不是在 `tracing.py` 里 `os.getenv`，
+  标签与 audit 共用一个模块；tag 带 `build:` 前缀；新增 `CORECODER_USER`（不设不记）
+- 新增一条限制（3.3 第 4 条）：子 agent 与父同会话后，`run_summary` 每回合可能两行，且子那行的
+  成本增量是父的子集——按会话求和成本会高估，改用 `llm_call` 行
+- B7 故意推后：SDK 侧 API 实测全部公开可用，缺的是判断来源；凭 `outcome` 打分只会造出自家评分
+- 本轮验证：三命令 **364 passed / 1 skipped**（354 + 十条新用例）、compileall 无输出、ruff 绿；
+  每条新用例都先跑成失败。另跑一次真实后端的在线复核（`ScriptedLLM`，不调模型）：
+  审计行的 `trace_id` 命中 REST 返回 200，新 trace 实测 `tags=['build:probe']`、`userId=synapse`、
+  `trace.output='parent answer'`，失败运行的工具 span 与 root 都是 `level=ERROR`，
+  子 agent 挂在父的 `tool.agent` 下且两条运行同一 `sessionId`（探针 `.tmp/live_check.py`，不入库）
+
 ## 附录 A：读数命令
 
 全部在仓库根目录执行（Windows cmd），输出即本文 3.1 的统计口径。命令均为单行，不要按显示宽度断行。
@@ -678,9 +760,11 @@ v1.2 实测：`.env` 里 `CORECODER_TRACE=langfuse` 后这个 glob 只命中 10-
 
 1. 顶部环境选择器选 `dogfood`——列表里应只剩真实运行，`tool.boom` 这类测试桩消失
 2. 过滤 `Level = ERROR`——应能筛到失败调用（若库已轮转清空，用一次故意失败的调用复现）
+   （**v1.8 已可用**：CoreCoder 自己开始写 `level=ERROR` 了）
 3. 打开任一 `agent.chat`——trace 详情应同时有 input 与 output，Scores 区应有一条 `outcome` 分类分
    （v1.6 提醒：input 现在已经有了，是 `capture_request` 写的；真正缺的只有 root 的 output。
-   别拿「能看到正文」当 B4 已修——正文在 `llm.round` 那一层，本来就在）
+   别拿「能看到正文」当 B4 已修——正文在 `llm.round` 那一层，本来就在。
+   **v1.8：root 的 output 已落地**，列表页那一栏不再永远为空；只有 Scores 那一步仍无数据（B7））
 
 本文 3.4 的数字来自一次只读探针（REST `/api/public/traces` 与 `/api/public/observations`），
 脚本放在 `.tmp/` 下、不入库，所以不在这里给命令；复算请用上面的 UI 三步，或直接调 A.7 的端点。
@@ -707,8 +791,22 @@ curl -s -o NUL -w "%{http_code}\n" -u <pk:sk> "http://localhost:3000/api/public/
 ```
 
 v1.2 的实测基线：审计行共 531 个 `trace_id`，与 Langfuse 最新 100 条 trace id **交集 0**，
-按这条路子查一律 404（见 3.5 的 N2）。同理可验 observation 类型分布：
-`/api/public/observations?type=EVENT&limit=1` 的 `meta.totalItems` 就是 3.4 表里的 EVENT 计数。
+按这条路子查一律 404（见 3.5 的 N2）。**v1.8 已反转为 200**（C2），且新写入的 id 形状本身就是信号：
+`span_id` 从自造的 32 位 hex 变成后端的 16 位 hex（旧审计行仍是 32 位，那是采用前的数据）。
+同理可验 observation 类型分布：`/api/public/observations?type=EVENT&limit=1` 的 `meta.totalItems` 就是
+3.4 表里的 EVENT 计数。另两条 v1.8 新增的复算口径（均只读）：
+
+```bat
+curl -s -u <pk:sk> "http://localhost:3000/api/public/traces?limit=1&tags=build:dogfood" | .venv\Scripts\python.exe -c "import json,sys;d=json.load(sys.stdin);print('tagged',d['meta']['totalItems'],[(t.get('sessionId'),t.get('userId'),str(t.get('output'))[:40]) for t in d['data'][:3]])"
+```
+
+量的是 B8（tags 有值）与 B4（trace 层 output 有值）；`userId` 只在 `.env` 设了 `CORECODER_USER` 时非空。
+
+```bat
+curl -s -u <pk:sk> "http://localhost:3000/api/public/observations?level=ERROR&limit=3" | .venv\Scripts\python.exe -c "import json,sys;d=json.load(sys.stdin);print('ERROR total',d['meta']['totalItems']);print([(o.get('name'),str(o.get('statusMessage'))[:40]) for o in d['data']])"
+```
+
+量的是 B1：v1.2 时全库只有 2 条且都是探针自写的，v1.8 起 CoreCoder 自己会往这里写。
 
 **A.8 保留上限是否生效（0D 的复算口径）**
 
@@ -730,12 +828,16 @@ v1.2 的实测基线：审计行共 531 个 `trace_id`，与 Langfuse 最新 100
 
 ## 附录 B：`CORECODER_BUILD` 字段说明
 
-**它是什么**：给每次运行结束时写的那行 `run_summary` 多加一个 `build` 字段，仅此一个作用。
+**它是什么**：同一个变量现在进两个地方——运行结束那行 `run_summary` 的 `build` 字段，以及 trace 层的
+`tags`（v1.8 随 B8）。v1.7 之前它只进 audit。
 
-- 唯一读取点：`Agent._log_run_summary`（`corecoder/agent.py`）
-- 唯一引用它的测试：`tests/test_audit.py` 的 `test_run_summary_carries_version_and_build`（断言值为 `abc123`）
+- 两个读取点，都在 `corecoder/agent.py`：`Agent._log_run_summary`（写 audit 的 `build=`）与
+  `Agent._labels`（写 trace 的 `tags=["build:…"]`）。**故意不放在 `tracing.py`**，理由见本文末尾
+  「与 B8 的关系」
+- 引用它的测试（全仓库只这两处）：`tests/test_audit.py` 的
+  `test_run_summary_carries_version_and_build`（断言值为 `abc123`）与 `tests/test_tracing.py` 的
+  `test_the_run_is_tagged_and_attributed_at_trace_level`
 - **不改变 agent 任何行为**：不是开关，不是功能门
-- **只进 audit，不进 trace**：`corecoder/tracing.py` 不读这个变量
 - 两份 README、`AGENTS.md`、`article/` 均未提及它
 
 **原意**：构建标识（与 `version` 并列，测试里用 git sha 风格的 `abc123`），用来回答「这个 bug 是哪个构建引入的」。
@@ -746,7 +848,9 @@ v1.2 的实测基线：审计行共 531 个 `trace_id`，与 Langfuse 最新 100
 **一个便利细节**：`Config._load_dotenv` 用 `load_dotenv(..., override=False)`，即**进程环境变量优先于 `.env`**。
 所以把 `CORECODER_BUILD=dogfood` 写进 `.env` 当默认值，临时要换标签时 `set CORECODER_BUILD=xxx` 即可覆盖，不用改文件。
 
-**与 B8 的关系**：这个变量现在**只进 audit**，唯一读取点是 `Agent._log_run_summary`；
-`corecoder/tracing.py` 不读它，所以 trace 侧的 `tags` 现在拿不到它。B8 若要复用同一个值当运行来源标签，
-建议由 `chat()` 把它作为参数传进 `RunTrace.start_run`，而不是在 `tracing.py` 里另开一个 `os.getenv`——
-后者会把「谁在打标」拆成两个模块各管一半，将来改标签只改中一个就会两边不一致。
+**与 B8 的关系**（v1.8 已落地）：本变量现在**audit 与 trace 两边都有**——`Agent._log_run_summary` 写
+`build=dogfood`，`Agent._labels` 写 `tags=["build:dogfood"]`。落地方式就是本节原先建议的那条：
+由 `chat()` 把它当参数传进 `RunTrace.start_run`，而**不在 `tracing.py` 里 `os.getenv`**。
+原警告仍然成立且被本轮验证：拆两个模块各读一半，将来改标签只改中一个就会两边不一致；
+现在两个读取点同在一个文件，`tracing.py` 只负责传递。与之同机制的新变量是 `CORECODER_USER`
+（只读开关，不设则 `userId=None`），也放在 `Agent._labels` 里读。
