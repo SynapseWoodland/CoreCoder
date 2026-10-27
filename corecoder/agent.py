@@ -88,6 +88,13 @@ class Agent:
         self.hooks = hooks
         self.max_tool_result_chars = max_tool_result_chars
         self._tool_by_name = {t.name: t for t in self.tools}
+        # tool schemas are sent on every round and re-estimated by every
+        # compression check; both read one cached pair, rebuilt only when the
+        # tool catalog itself changes (a stable list also keeps the request
+        # bytes identical so a provider's prefix cache can discount them)
+        self._schema_cache: list[dict] = []
+        self._schema_json: str = ""
+        self._schema_sig: tuple | None = None
         self.messages: list[dict] = []
         self.context = ContextManager(max_tokens=max_context_tokens)
         self.max_rounds = max_rounds
@@ -130,14 +137,34 @@ class Agent:
             for m in self._full_messages()
         ]
 
+    def _ensure_schema_cache(self) -> None:
+        """Rebuild the cached schemas only when the tool catalog changed.
+
+        The signature is the tuple of tool identities: adding, removing or
+        swapping a tool object lands here, while an unchanged catalog reuses
+        the prior list and its serialized form. A tool mutated in place (same
+        object, new description) is not detected - none of the registration
+        paths do that: MCP and the constructor always introduce new objects.
+        """
+        sig = tuple(id(t) for t in self.tools)
+        if sig != self._schema_sig:
+            self._schema_cache = [t.schema() for t in self.tools]
+            self._schema_json = json.dumps(self._schema_cache)
+            self._schema_sig = sig
+
     def _tool_schemas(self) -> list[dict]:
-        return [t.schema() for t in self.tools]
+        self._ensure_schema_cache()
+        return self._schema_cache
+
+    def _schema_json_str(self) -> str:
+        self._ensure_schema_cache()
+        return self._schema_json
 
     def _fixed_prompt_tokens(self) -> int:
         """Tokens every request carries that are not in `self.messages`."""
         system = self._full_messages()[0]["content"]
         return (estimate_tokens([{"role": "system", "content": system}])
-                + estimate_tokens([{"content": json.dumps(self._tool_schemas())}]))
+                + estimate_tokens([{"content": self._schema_json_str()}]))
 
     def chat(self, user_input: str, on_token=None, on_tool=None, on_reasoning=None) -> str:
         """Process one user message. May involve multiple LLM/tool rounds."""
@@ -256,7 +283,9 @@ class Agent:
             metrics = _call_metrics(resp, call_started, call_cost_before,
                                     self._estimated_cost(), retried)
             log_event("llm_call", round=current_round, model=self._model,
-                      estimated_prompt=estimated_prompt, **metrics)
+                      estimated_prompt=estimated_prompt,
+                      schema_tokens=estimate_tokens(
+                          [{"content": self._schema_json_str()}]), **metrics)
             call.record(metrics)
             call.capture_output(resp.content or "")
         self._account_usage(run, resp)
