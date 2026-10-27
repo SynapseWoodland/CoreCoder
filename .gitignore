@@ -17,6 +17,7 @@ venv/
 .tmp/
 .idea/
 .playwright-mcp/
+.qoder/
 uv.lock
 tmp_*.txt
 # bug-repro scripts waiting on their fix; add with `git add -f` once fixed
