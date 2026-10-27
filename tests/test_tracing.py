@@ -436,6 +436,32 @@ def test_default_trace_files_keep_newest_ten(tmp_path):
     assert not (tmp_path / "traces.1010.jsonl").exists()
 
 
+def test_an_empty_trace_file_setting_still_prunes_the_pid_files(tmp_path, monkeypatch):
+    """``CORECODER_TRACE_FILE=`` means the per-process default, so retention
+    applies to it as well.
+
+    The default path is chosen by truthiness, so the prune decision has to use
+    the same test: an empty setting used to land on ``traces.<pid>.jsonl`` and
+    leave the pile unbounded.
+    """
+    now = time.time()
+    for i in range(11):
+        old = tmp_path / f"traces.{2000 + i}.jsonl"
+        old.write_text("{}\n", encoding="utf-8")
+        os.utime(old, (now - i * 10, now - i * 10))
+
+    monkeypatch.setattr(tracing, "_default_trace_path",
+                        lambda: tmp_path / f"traces.{os.getpid()}.jsonl")
+    monkeypatch.setenv("CORECODER_TRACE_FILE", "")
+    tracer = tracing._jsonl_tracer(None, False)
+    try:
+        kept = sorted(tmp_path.glob("traces.*.jsonl"))
+        assert len(kept) == 10
+        assert not (tmp_path / "traces.2010.jsonl").exists()
+    finally:
+        tracer._tracer.close()
+
+
 # ─── Langfuse nested context is entered/exited in order ────────────────────
 
 def test_langfuse_spans_are_nested_in_order():

@@ -584,7 +584,10 @@ def _jsonl_tracer(file, capture_content: bool):
     try:
         return SafeTracer(JsonlTracer(
             path, capture_content=capture_content, max_bytes=_max_trace_bytes(),
-            prune=explicit is None))
+            # truthy, not ``is None``: an empty ``CORECODER_TRACE_FILE`` fell
+            # through to the pid-suffixed default above, and those files are
+            # the ones that need count-based retention
+            prune=not explicit))
     except Exception as e:  # noqa: BLE001 - unwritable path is not fatal
         _warn_disabled(f"jsonl_{type(e).__name__}")
         return NullTracer()

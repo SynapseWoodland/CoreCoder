@@ -268,7 +268,7 @@ def test_tool_decision_and_result_are_logged_per_call():
     assert decision["call_id"] == "abc"
     assert decision["decision"] == "execute"
     assert decision["args_chars"] == "0"
-    assert decision["decision_ms"].isdigit()
+    assert float(decision["decision_ms"]) >= 0  # sub-ms precision, same as duration_ms
 
     result = _fields(_lines(out, "tool_result")[0])
     assert result["call_id"] == "abc"
@@ -631,6 +631,32 @@ def test_prune_count_is_configurable_and_a_bad_value_falls_back(monkeypatch, tmp
     seed(15, base=4000)
     audit.configure_audit()
     assert len(list(tmp_path.glob("audit.*.log"))) == 10
+
+
+def test_an_empty_audit_file_setting_still_prunes_the_pid_logs(monkeypatch, tmp_path):
+    """``CORECODER_AUDIT_FILE=`` is the pid-suffixed default, so it keeps the
+    default's retention.
+
+    The path is picked by truthiness while retention used to be keyed on
+    ``is None``, so an empty setting landed on ``audit.<pid>.log`` and never
+    pruned: the per-process files piled up with retention silently off.
+    """
+    target = tmp_path / f"audit.{os.getpid()}.log"
+    monkeypatch.setattr(audit, "_default_audit_path", lambda: target)
+    monkeypatch.setenv("CORECODER_AUDIT_FILE", "")
+    monkeypatch.setenv("CORECODER_AUDIT_KEEP", "3")
+    for i in range(6):
+        path = tmp_path / f"audit.{5000 + i}.log"
+        path.write_text("x", encoding="utf-8")
+        os.utime(path, (3000 + i, 3000 + i))
+
+    audit.configure_audit()
+    audit.log_event("probe")
+
+    remaining = list(tmp_path.glob("audit.*.log"))
+    assert len(remaining) == 3
+    assert target in remaining
+    assert "event=probe" in target.read_text(encoding="utf-8")
 
 
 # ─── 7. degradation and privacy ────────────────────────────────────────────

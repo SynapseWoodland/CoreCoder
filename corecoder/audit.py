@@ -213,10 +213,12 @@ def _open_audit_file(file=None) -> logging.Handler:
         os.replace(path, str(path) + ".1")
 
     fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-    if explicit is None:
-        # pid-suffixed files accumulate over many sessions; size rotation
-        # almost never fires for them, so count-based retention is the real cap
-        # -- and ten of them is less than a day of real runs, so it is a setting
+    if not explicit:
+        # the same truthiness that picked the path above: an empty setting is
+        # still the pid-suffixed default. Those files accumulate over many
+        # sessions; size rotation almost never fires for them, so count-based
+        # retention is the real cap -- and ten of them is less than a day of
+        # real runs, so it is a setting
         prune_old_logs(
             path.parent / "audit.*.log",
             keep=_env_int("CORECODER_AUDIT_KEEP", _DEFAULT_KEEP), skip=path)
