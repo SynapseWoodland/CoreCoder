@@ -12,7 +12,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 from . import __version__
-from .agent import Agent, TruncatedOutput
+from .agent import Agent, BudgetExceeded, TruncatedOutput
 from .audit import configure_logging
 from .config import Config
 from .hooks import load_hooks
@@ -79,12 +79,14 @@ def main():
         sys.exit(1)
 
     llm_cls = LiteLLM if config.provider == "litellm" else LLM
+    fallback = [m.strip() for m in config.fallback_models.split(",") if m.strip()]
     llm = llm_cls(
         model=config.model,
         api_key=config.api_key,
         base_url=config.base_url,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
+        fallback_models=fallback,
     )
     # consent layer: ask in the REPL, refuse in one-shot mode, --yes skips it
     if args.yes:
@@ -99,6 +101,7 @@ def main():
         max_context_tokens=config.max_context_tokens,
         permission=permission,
         hooks=load_hooks(),
+        budget_ceiling=config.budget_ceiling,
     )
 
     # resume saved session
@@ -167,6 +170,10 @@ def _run_once(agent: Agent, prompt: str):
     except TruncatedOutput as e:
         # the answer is unusable: stderr + non-zero so scripts and CI see it
         err_console.print(f"\n[red]Error: {e}[/red]")
+        sys.exit(1)
+    except BudgetExceeded as e:
+        # the run was cut off on purpose: surface it distinctly, non-zero
+        err_console.print(f"\n[red]Budget stopped: {e}[/red]")
         sys.exit(1)
     except Exception as e:  # noqa: BLE001
         # one-shot mode: print whatever went wrong and exit non-zero

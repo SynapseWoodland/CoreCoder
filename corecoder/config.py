@@ -32,6 +32,10 @@ class Config:
     temperature: float = 0.0
     max_context_tokens: int = 128_000
     provider: str = "openai"
+    # comma-separated candidate chain tried when the primary is unavailable
+    fallback_models: str = ""
+    # per-run USD cap; None means no cap
+    budget_ceiling: float | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -44,6 +48,7 @@ class Config:
             or os.getenv("DEEPSEEK_API_KEY")
             or ""
         )
+        budget_raw = os.getenv("CORECODER_BUDGET_CEILING", "").strip()
         return cls(
             model=os.getenv("CORECODER_MODEL", "gpt-5.5"),
             api_key=api_key,
@@ -52,4 +57,6 @@ class Config:
             temperature=float(os.getenv("CORECODER_TEMPERATURE", "0")),
             max_context_tokens=int(os.getenv("CORECODER_MAX_CONTEXT", "128000")),
             provider=os.getenv("CORECODER_PROVIDER", "openai"),
+            fallback_models=os.getenv("CORECODER_FALLBACK_MODELS", ""),
+            budget_ceiling=float(budget_raw) if budget_raw else None,
         )

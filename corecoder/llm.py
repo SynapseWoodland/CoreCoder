@@ -10,6 +10,7 @@ single unified interface. Set CORECODER_PROVIDER=litellm.
 """
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -150,16 +151,33 @@ def _log_retry(stage: str, attempt: int, status, error_type: str) -> None:
               status=status if status is not None else "", error_type=error_type)
 
 
+def _is_retryable_error(exc: APIError) -> bool:
+    """Whether an error is worth re-issuing against another model.
+
+    Transient/availability failures only. A 4xx - a context-length rejection,
+    a bad request - is not: the caller's own recovery (overflow collapse,
+    argument repair) must still see the real failure, so it never falls forward.
+    """
+    if isinstance(exc, (RateLimitError, APITimeoutError, APIConnectionError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    return bool(status and status >= 500)
+
+
 class LLM:
     def __init__(
         self,
         model: str,
         api_key: str,
         base_url: str | None = None,
+        fallback_models: list[str] | None = None,
         **kwargs,
     ):
         self.model = model
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+        # candidate chain tried, in order, when the primary exhausts its retries
+        # on a transient error; kept out of `extra` so it is never sent upstream
+        self.fallback_models = list(fallback_models or [])
         self.extra = kwargs  # temperature, max_tokens, etc.
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -189,8 +207,39 @@ class LLM:
         thinking models (deepseek-reasoner, kimi-k2-thinking, ...). Reasoning
         is display-only: it never enters the history, since providers reject
         it when sent back.
+
+        Availability fallback: when the primary model exhausts its retries on
+        a transient error, the same request is re-issued against each fallback
+        model in turn. A non-retryable error propagates untouched so the
+        caller's own recovery still sees the real failure.
         """
         params = self._request_params(messages, tools)
+        chain = self._model_chain()
+        last_err: Exception | None = None
+        for idx, model in enumerate(chain):
+            params["model"] = model
+            try:
+                return self._chat_with_retries(params, on_token, on_reasoning)
+            except APIError as e:
+                if not _is_retryable_error(e):
+                    raise
+                last_err = e
+                if idx + 1 < len(chain):
+                    log_event("model_fallback", level=logging.WARNING,
+                              from_model=model, to_model=chain[idx + 1],
+                              error_type=type(e).__name__)
+        raise last_err
+
+    def _model_chain(self) -> list[str]:
+        """Primary model first, then each fallback once; blanks and dupes dropped."""
+        chain: list[str] = []
+        for model in [self.model, *getattr(self, "fallback_models", [])]:
+            if model and model not in chain:
+                chain.append(model)
+        return chain
+
+    def _chat_with_retries(self, params: dict, on_token, on_reasoning) -> LLMResponse:
+        """Run one model through the bounded retry loop, or raise its last error."""
         last_err = None
         for attempt in range(3):
             stream = self._open_stream(params, attempt)
@@ -391,12 +440,14 @@ class LiteLLM(LLM):
         model: str,
         api_key: str | None = None,
         base_url: str | None = None,
+        fallback_models: list[str] | None = None,
         **kwargs,
     ):
         # skip LLM.__init__ which creates an OpenAI client
         self.model = model
         self.api_key = api_key
         self.base_url = base_url
+        self.fallback_models = list(fallback_models or [])
         self.extra = kwargs
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0

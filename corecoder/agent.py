@@ -39,6 +39,12 @@ class TruncatedOutput(RuntimeError):
     as success by sub-agents, so the failure would be invisible."""
 
 
+class BudgetExceeded(RuntimeError):
+    """A single run crossed its cost ceiling. Raised rather than returned so the
+    runaway task stops immediately instead of spending another round: the point
+    of the fuse is to cut power, not to report the bill afterwards."""
+
+
 @dataclass
 class _RunStats:
     """What one ``chat()`` accumulates for the run summary and the root span."""
@@ -74,9 +80,13 @@ class Agent:
         session_id: str | None = None,
         tracer=None,
         loaded_names=None,
+        budget_ceiling: float | None = None,
     ):
         self.llm = llm
         self.session_id = session_id or new_session_id()
+        # per-run USD cap; None means no cap. Enforced in _account_usage against
+        # the cost accrued since the run started, so a runaway task is cut off
+        self.budget_ceiling = budget_ceiling
         self.tracer = tracer if tracer is not None else create_tracer()
         # everything the loop reports about tracing goes through this adapter,
         # so the loop itself never names a span or a capture flag
@@ -407,14 +417,34 @@ class Agent:
                           messages_after=len(self.messages), error_type=error_type)
         return self._chat_once(on_token, on_reasoning)
 
-    @staticmethod
-    def _account_usage(run, resp) -> None:
-        """Only reported usage becomes a total; unreported zeros stay unknown."""
+    def _account_usage(self, run, resp) -> None:
+        """Fold one call's usage into the run totals, then enforce the budget.
+
+        Only reported usage becomes a total; unreported zeros stay unknown. The
+        budget check runs after accounting so the round that tips the scale is
+        the one that trips the fuse.
+        """
         if resp.usage_reported:
             run.tokens_in += resp.prompt_tokens
             run.tokens_out += resp.completion_tokens
         else:
             run.usage_reported = False
+        self._check_budget(run)
+
+    def _check_budget(self, run) -> None:
+        """Stop the run once its accrued cost crosses the configured ceiling."""
+        if self.budget_ceiling is None:
+            return
+        spent = _cost_delta(run.cost_before, self._estimated_cost())
+        if spent is None:
+            return  # unpriced model: nothing mechanical to enforce against
+        if spent > self.budget_ceiling:
+            self._record("budget_exceeded", level=logging.WARNING,
+                         spent_usd=round(spent, 6),
+                         ceiling_usd=self.budget_ceiling, rounds=run.rounds)
+            raise BudgetExceeded(
+                f"budget ceiling exceeded: ${spent:.4f} > ${self.budget_ceiling:.4f}"
+            )
 
     def _tool_round(self, resp, on_tool, current_round: int, run) -> None:
         """Execute one round of tool calls, then backfill any missing replies."""
@@ -985,6 +1015,8 @@ def _outcome_of(exc: BaseException) -> str:
     """The run-summary vocabulary for a failure that escaped the round loop."""
     if isinstance(exc, TruncatedOutput):
         return "truncated"
+    if isinstance(exc, BudgetExceeded):
+        return "budget"
     if isinstance(exc, KeyboardInterrupt):
         return "interrupted"
     return "error"
