@@ -424,7 +424,9 @@ class Agent:
         # consent: no side effect, and nobody is asked to approve junk
         start = time.perf_counter()
         result, decision = self._decide(tc)
-        decision_ms = int((time.perf_counter() - start) * 1000)
+        # sub-millisecond decisions (a fast hook, an auto-approved call) must
+        # not collapse to a misleading zero, same as duration_ms below
+        decision_ms = round((time.perf_counter() - start) * 1000, 3)
         self._log_decision(tc, decision, decision_ms, round_idx)
         meta: dict = {"decision_ms": decision_ms}
         if result is None:
@@ -463,7 +465,7 @@ class Agent:
         except (TypeError, ValueError):
             return 0
 
-    def _log_decision(self, tc, decision: str, decision_ms: int, round_idx=None) -> None:
+    def _log_decision(self, tc, decision: str, decision_ms: float, round_idx=None) -> None:
         log_event(
             "tool_decision", **self._round_fields(round_idx), tool=tc.name,
             call_id=tc.id, decision=decision, args_chars=self._args_chars(tc),
@@ -679,12 +681,12 @@ class Agent:
         for tc in tool_calls:
             if on_tool:
                 on_tool(tc.name, tc.arguments)
-        settled: list[tuple[str | None, str, int]] = []
+        settled: list[tuple[str | None, str, float]] = []
         results: list[str | None] = []
         for tc in tool_calls:
             start = time.perf_counter()
             result, decision = self._decide(tc)
-            decision_ms = int((time.perf_counter() - start) * 1000)
+            decision_ms = round((time.perf_counter() - start) * 1000, 3)
             self._log_decision(tc, decision, decision_ms, round_idx)
             settled.append((result, decision, decision_ms))
             results.append(result)
