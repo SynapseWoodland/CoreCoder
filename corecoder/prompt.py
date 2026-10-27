@@ -12,11 +12,23 @@ task, present the plan as a numbered list and stop. Do not execute any of it
 until the user approves."""
 
 
-def system_prompt(tools) -> str:
+def _short(desc: str, limit: int = 50) -> str:
+    """One compact line for the deferred index: never the full description."""
+    desc = (desc or "").strip().replace("\n", " ")
+    return desc if len(desc) <= limit else desc[: limit - 1].rstrip() + "\u2026"
+
+
+def system_prompt(tools, deferred=None) -> str:
     cwd = os.getcwd()
     # names only: the full description already ships in the structured tools=
     # array every request, so repeating it here doubles the fixed overhead
     tool_list = "\n".join(f"- **{t.name}**" for t in tools)
+    if deferred:
+        # P3: tools whose full schema is withheld until search_tools loads
+        # them. The model still needs to know they exist, so list name + a
+        # short summary - a hint for a keyword, not the schema itself.
+        index = "\n".join(f"- **{t.name}**: {_short(t.description)}" for t in deferred)
+        tool_list += "\n\n# Deferred tools (call search_tools to load one)\n" + index
     uname = platform.uname()
 
     return f"""\

@@ -118,6 +118,33 @@ def test_call_round_trip_returns_text_content(mcp_config):
     assert result["role"] == "tool" and result["content"] == "echo: hi"
 
 
+def test_deferred_mcp_tool_searches_then_calls(mcp_config, monkeypatch):
+    # CORECODER_TOOL_SEARCH=on forces the 4 MCP tools behind the index, so the
+    # model must first search_tools("echo") and only then can it call the tool
+    monkeypatch.setenv("CORECODER_TOOL_SEARCH", "on")
+    agent = _agent(
+        [
+            LLMResponse(tool_calls=[ToolCall(
+                id="s1", name="search_tools", arguments={"query": "echo"})]),
+            LLMResponse(tool_calls=[_echo_call("c2", "hi")]),
+            LLMResponse(content="done"),
+        ],
+        load_mcp_tools(mcp_config),
+    )
+
+    # before any search the echo schema is not on the wire, only the index
+    sent0 = [s["function"]["name"] for s in agent._tool_schemas()]
+    assert "mcp__fake__echo" not in sent0 and "search_tools" in sent0
+
+    assert agent.chat("go") == "done"
+
+    # after searching, the full schema is on the wire verbatim and the call ran
+    sent_final = {s["function"]["name"]: s for s in agent._tool_schemas()}
+    assert sent_final["mcp__fake__echo"]["function"]["parameters"]["required"] == ["text"]
+    results = {m["tool_call_id"]: m["content"] for m in agent.messages if m["role"] == "tool"}
+    assert results["c2"] == "echo: hi"
+
+
 def test_parallel_calls_to_one_server_dont_cross_wires(mcp_config):
     agent = _agent(
         [LLMResponse(tool_calls=[_echo_call("c1", "one"), _echo_call("c2", "two")]),

@@ -53,6 +53,11 @@ def _observability_isolated(tmp_path, monkeypatch):
     # that supplied no label at all
     monkeypatch.delenv("CORECODER_BUILD", raising=False)
     monkeypatch.delenv("CORECODER_USER", raising=False)
+    # tool-search deferral is a runtime knob: an inherited value would hide MCP
+    # schemas behind search_tools and change the eager path the suite asserts on
+    monkeypatch.delenv("CORECODER_TOOL_SEARCH", raising=False)
+    monkeypatch.delenv("CORECODER_TOOL_SEARCH_MIN_COUNT", raising=False)
+    monkeypatch.delenv("CORECODER_TOOL_SEARCH_PCT", raising=False)
     # the sink is cached in module state, so re-pointing the env needs a reset
     audit.reset_audit()
     yield

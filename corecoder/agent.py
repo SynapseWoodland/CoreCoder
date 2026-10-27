@@ -73,6 +73,7 @@ class Agent:
         max_tool_result_chars: int = 15_000,
         session_id: str | None = None,
         tracer=None,
+        loaded_names=None,
     ):
         self.llm = llm
         self.session_id = session_id or new_session_id()
@@ -98,7 +99,16 @@ class Agent:
         self.messages: list[dict] = []
         self.context = ContextManager(max_tokens=max_context_tokens)
         self.max_rounds = max_rounds
-        self._system = system_prompt(self.tools)
+        # P3: with a large MCP catalog only its index rides in the prompt and
+        # each tool's full schema is pulled on demand by search_tools. A small
+        # or MCP-free catalog leaves the sent bytes identical to the eager path.
+        # loaded_names is only honored when it is a real collection (a mocked
+        # parent hands us a stand-in attribute, not a set of names).
+        self._loaded: set[str] = (
+            set(loaded_names)
+            if isinstance(loaded_names, (set, frozenset, list, tuple)) else set()
+        )
+        self._build_catalog()
         self.plan_mode = False  # toggled by /plan; while on, mutating tools are refused
 
         # wire up sub-agent capability
@@ -137,8 +147,88 @@ class Agent:
             for m in self._full_messages()
         ]
 
+    def _should_defer(self, mcp: list[Tool]) -> bool:
+        """Whether the MCP catalog is big enough to hide behind search_tools.
+
+        ``CORECODER_TOOL_SEARCH`` is off|auto|on (default auto). auto engages
+        only past a tool-count or schema-size threshold, so a small MCP setup
+        - and every MCP-free run - stays on the byte-identical eager path.
+        """
+        if not mcp:
+            return False
+        mode = os.getenv("CORECODER_TOOL_SEARCH", "auto").strip().lower()
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+
+        def _env_int(key: str, default: int) -> int:
+            raw = os.getenv(key, "").strip()
+            try:
+                return int(raw) if raw else default
+            except ValueError:
+                return default
+
+        if len(mcp) >= _env_int("CORECODER_TOOL_SEARCH_MIN_COUNT", 10):
+            return True
+        pct = _env_int("CORECODER_TOOL_SEARCH_PCT", 8)
+        schema_tokens = estimate_tokens(
+            [{"content": json.dumps([t.schema() for t in mcp])}])
+        return schema_tokens >= self.context.max_tokens * pct / 100
+
+    def _build_catalog(self) -> None:
+        """Split the tool list into an eager set and a deferred MCP index."""
+        from .tools.search_tools import SearchToolsTool
+
+        core = [t for t in self.tools if not t.name.startswith("mcp__")]
+        mcp = [t for t in self.tools if t.name.startswith("mcp__")]
+        self._mcp_list = mcp
+        self._mcp_by_name = {t.name: t for t in mcp}
+        self._defer_mcp = self._should_defer(mcp)
+        if not self._defer_mcp:
+            self._search_tool = None
+            self._active_tools = list(self.tools)
+            self._system = system_prompt(self.tools)
+            return
+        self._search_tool = SearchToolsTool(self)
+        # search_tools is injected on demand, so it lives outside self.tools;
+        # register it for execution just like the sub-agent back-reference
+        self._tool_by_name[self._search_tool.name] = self._search_tool
+        loaded = [t for t in mcp if t.name in self._loaded]
+        self._active_tools = [*core, self._search_tool, *loaded]
+        deferred_index = [t for t in mcp if t.name not in self._loaded]
+        self._system = system_prompt([*core, self._search_tool], deferred=deferred_index)
+
+    def _activate_matching(self, query: str) -> list[str]:
+        """Pull deferred MCP tools onto the wire by name/description keyword."""
+        if not self._defer_mcp:
+            return []
+        q = (query or "").strip().lower()
+        hits = [
+            t for t in self._mcp_list
+            if t.name not in self._loaded
+            and (not q or q in t.name.lower() or q in (t.description or "").lower())
+        ]
+        for t in hits:  # registration order keeps the appended tail prefix-stable
+            self._loaded.add(t.name)
+            self._active_tools.append(t)
+        if hits:
+            self._schema_sig = None  # the active set grew; rebuild the cache once
+            log_event("tool_search", query=query, loaded=len(hits))
+            self._trace.event("tool_search", query=query, loaded=len(hits))
+        return [t.name for t in hits]
+
+    def _schema_source(self) -> list[Tool]:
+        """The list whose schemas are sent: the active set, or the raw catalog.
+
+        While deferral is off this is ``self.tools`` itself, so catalog edits
+        (append/replace) are reflected exactly as before; while on it is the
+        append-only active set grown by search_tools.
+        """
+        return self._active_tools if self._defer_mcp else self.tools
+
     def _ensure_schema_cache(self) -> None:
-        """Rebuild the cached schemas only when the tool catalog changed.
+        """Rebuild the cached schemas only when the sent catalog changed.
 
         The signature is the tuple of tool identities: adding, removing or
         swapping a tool object lands here, while an unchanged catalog reuses
@@ -146,9 +236,10 @@ class Agent:
         object, new description) is not detected - none of the registration
         paths do that: MCP and the constructor always introduce new objects.
         """
-        sig = tuple(id(t) for t in self.tools)
+        src = self._schema_source()
+        sig = tuple(id(t) for t in src)
         if sig != self._schema_sig:
-            self._schema_cache = [t.schema() for t in self.tools]
+            self._schema_cache = [t.schema() for t in src]
             self._schema_json = json.dumps(self._schema_cache)
             self._schema_sig = sig
 
@@ -802,6 +893,12 @@ class Agent:
     def reset(self):
         """Clear conversation history."""
         self.messages.clear()
+        # a fresh conversation starts from the minimal catalog again: tools the
+        # previous turn searched for are not carried over unless still eager
+        if self._defer_mcp:
+            self._loaded.clear()
+            self._schema_sig = None
+            self._build_catalog()
         # a user-visible reset must not leak the dead conversation's checklist
         # into the next system prompt
         todo = self._tool_by_name.get("todo_write")

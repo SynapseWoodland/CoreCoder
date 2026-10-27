@@ -57,6 +57,9 @@ class AgentTool(Tool):
             # caller never asked for
             tracer=parent.tracer,
             session_id=parent.session_id,
+            # reuse whatever the parent already searched for, so a deferred MCP
+            # tool stays callable in the child without a second search round
+            loaded_names=getattr(parent, "_loaded", None),
         )
 
         # a sub-agent failure comes back as text, never propagates into the parent
