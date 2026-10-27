@@ -378,7 +378,7 @@ class Agent:
                       schema_tokens=estimate_tokens(
                           [{"content": self._schema_json_str()}]), **metrics)
             call.record(metrics)
-            call.capture_output(resp.content or "")
+            call.capture_output(resp.content or "", _tool_call_view(resp))
         self._account_usage(run, resp)
         return resp
 
@@ -929,6 +929,19 @@ def _request_text(tc) -> str:
         return _redact(json.dumps(tc.arguments, ensure_ascii=False))
     except (TypeError, ValueError):
         return _redact(str(tc.arguments))
+
+
+def _tool_call_view(resp) -> list | None:
+    """The model's selection intent for the round's output, arguments redacted.
+
+    ``None`` when the round called nothing, so a pure-text round keeps its plain
+    string output. Only ``tc.arguments`` (the parsed dict, ``{}`` for broken
+    JSON) is rendered, so a truncated stream's raw text never reaches the trace.
+    """
+    if not resp.tool_calls:
+        return None
+    return [{"name": tc.name, "arguments": _request_text(tc)}
+            for tc in resp.tool_calls]
 
 
 def _result_fields(decision: str, meta: dict) -> dict:

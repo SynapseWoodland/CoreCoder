@@ -662,8 +662,20 @@ class GenerationTrace:
     def record(self, metrics: dict) -> None:
         self._span.update(**metrics)
 
-    def capture_output(self, text: str) -> None:
-        if self._capture:
+    def capture_output(self, text: str, tool_calls: list | None = None) -> None:
+        """Record what the model returned this round.
+
+        A round that only talks stays a plain string, byte-for-byte as before.
+        A round that selected tools also carries that selection, so the intent
+        is visible on the GENERATION row instead of an empty output; the caller
+        has already redacted each call's arguments to text.
+        """
+        if not self._capture:
+            return
+        if tool_calls:
+            self._span.update(output={"content": text or None,
+                                      "tool_calls": tool_calls})
+        else:
             self._span.update(output=text)
 
 

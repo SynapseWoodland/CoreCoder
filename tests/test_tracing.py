@@ -175,6 +175,77 @@ def test_capture_content_records_redacted_tool_io(tmp_path):
     assert "sk-abcdefghijklmnop1234" not in json.dumps(tool_span)
 
 
+def test_generation_output_records_the_models_tool_choice(tmp_path):
+    """The round that picked a tool has to show that pick in its own output.
+
+    The tool name already lives on the ``tool.*`` child span, but a reader
+    looking at the GENERATION row saw an empty string there and had to
+    cross-link to the child to learn what the model had chosen. Recording the
+    selection intent makes the decision visible where it was made.
+    """
+    path = tmp_path / "trace.jsonl"
+    tracer = JsonlTracer(path, capture_content=True)
+    tool, llm = one_tool_round()  # round 1 calls spy(text="ping"); round 2 says done
+    make_agent(tracer, tool=tool, llm=llm).chat("go")
+
+    generations = [r for r in rows(path) if r["type"] == "generation"]
+    choice = next(g["attrs"]["output"] for g in generations
+                  if isinstance(g["attrs"].get("output"), dict))
+    assert choice["tool_calls"][0]["name"] == "spy"
+    assert "ping" in choice["tool_calls"][0]["arguments"]
+    # a pure-text round keeps its plain-string output exactly as before
+    assert generations[-1]["attrs"]["output"] == "done"
+
+
+def test_generation_output_redacts_secrets_in_tool_arguments(tmp_path):
+    """The intent is content, so the same redaction the tool span uses applies."""
+    path = tmp_path / "trace.jsonl"
+    tracer = JsonlTracer(path, capture_content=True)
+    llm = scripted(
+        LLMResponse(content="", tool_calls=[
+            ToolCall(id="c1", name="spy",
+                     arguments={"text": "sk-abcdefghijklmnop1234"})]),
+        LLMResponse(content="done"),
+    )
+    make_agent(tracer, llm=llm).chat("go")
+
+    generations = [r for r in rows(path) if r["type"] == "generation"]
+    blob = json.dumps(generations[0]["attrs"]["output"])
+    assert "[REDACTED:api_key]" in blob
+    assert "sk-abcdefghijklmnop1234" not in blob
+
+
+def test_generation_output_never_leaks_broken_tool_arguments(tmp_path):
+    """A truncated stream's raw JSON stays out of the recorded intent.
+
+    The same red line the tool span honours: a half-written ``raw_arguments``
+    is never copied out, so the generation output carries the parsed (empty)
+    arguments, not the malformed text.
+    """
+    path = tmp_path / "trace.jsonl"
+    tracer = JsonlTracer(path, capture_content=True)
+    broken = ToolCall(id="c1", name="spy", arguments={},
+                      raw_arguments='{"text": "pi', arguments_error="not json")
+    llm = scripted(
+        LLMResponse(content="", tool_calls=[broken]),
+        LLMResponse(content="done"),
+    )
+    make_agent(tracer, llm=llm).chat("go")
+
+    assert '{"text": "pi' not in json.dumps(rows(path))
+
+
+def test_generation_output_stays_hidden_without_content_capture(tmp_path):
+    """Selection intent is content: the opt-in still gates it."""
+    path = tmp_path / "trace.jsonl"
+    tracer = JsonlTracer(path)
+    tool, llm = one_tool_round()
+    make_agent(tracer, tool=tool, llm=llm).chat("go")
+
+    for record in rows(path):
+        assert "output" not in record["attrs"]
+
+
 # ─── 3. Langfuse pseudo client ─────────────────────────────────────────────
 
 class FakeObservation:
