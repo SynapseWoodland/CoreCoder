@@ -189,3 +189,41 @@ class TestEstimationEntranceUnchanged:
             "the estimation and the request must read the same cached object, "
             "or schema_tokens would describe a payload nobody sent"
         )
+
+
+# ─── 5. P1: the system prompt must stop re-listing every description ────────
+
+
+class TestPromptSlimming:
+    """The catalog in # Tools duplicates, verbatim, the description the model
+    already gets in the structured ``tools=`` array. Dropping it from the
+    prompt shrinks the fixed overhead without losing any capability signal."""
+
+    def test_system_prompt_lists_tool_names_only(self):
+        from corecoder.prompt import system_prompt
+
+        spy = SpyTool()
+        spy.description = "SENTINEL_DESC_must_not_appear_in_the_prompt"
+        prompt = system_prompt([spy])
+
+        assert spy.name in prompt, "the tool must still be enumerable"
+        assert spy.description not in prompt, (
+            "description is still copied into the system prompt: it is already "
+            "in tools=, so every request carries it twice"
+        )
+
+    def test_schema_descriptions_survive_prompt_slimming(self):
+        spy = SpyTool()
+        spy.description = "SENTINEL_DESC_must_survive_in_tools"
+        llm = RecordingLLM([LLMResponse(content="ok")])
+        agent = Agent(llm=llm, tools=[spy])
+        assert agent.chat("hi") == "ok"
+
+        # whatever the slimmed prompt says, the model still receives the full
+        # description where function calling actually reads it
+        [sent] = llm.seen
+        [doc] = sent["tools"]
+        assert doc["function"]["description"] == spy.description, (
+            "slimming the prompt must not slim the tools= schema: the "
+            "description is how the model chooses and calls a tool"
+        )

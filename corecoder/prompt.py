@@ -14,7 +14,9 @@ until the user approves."""
 
 def system_prompt(tools) -> str:
     cwd = os.getcwd()
-    tool_list = "\n".join(f"- **{t.name}**: {t.description}" for t in tools)
+    # names only: the full description already ships in the structured tools=
+    # array every request, so repeating it here doubles the fixed overhead
+    tool_list = "\n".join(f"- **{t.name}**" for t in tools)
     uname = platform.uname()
 
     return f"""\
