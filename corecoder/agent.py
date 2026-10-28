@@ -26,7 +26,7 @@ from .prompt import PLAN_MODE_PROMPT, system_prompt
 from .session import new_session_id
 from .tools import ALL_TOOLS
 from .tools.agent import AgentTool
-from .tools.base import Tool, ToolRefused
+from .tools.base import SubagentTruncated, Tool, ToolRefused
 from .tools.bash import get_tracked_cwd, set_tracked_cwd
 from .tools.todo import TodoWriteTool
 from .tracing import RunTrace, create_tracer
@@ -84,9 +84,14 @@ class Agent:
         tracer=None,
         loaded_names=None,
         budget_ceiling: float | None = None,
+        is_sub: bool = False,
     ):
         self.llm = llm
         self.session_id = session_id or new_session_id()
+        # G5: a sub-agent shares the parent's llm, so its cost delta already
+        # sits inside the parent's; the run summary must say which agent wrote
+        # the line or summing the rows double-counts the child's whole share
+        self.is_sub = is_sub
         # per-run USD cap; None means no cap. Enforced in _account_usage against
         # the cost accrued since the run started, so a runaway task is cut off
         self.budget_ceiling = budget_ceiling
@@ -560,6 +565,7 @@ class Agent:
             "version": __version__,
             "build": os.getenv("CORECODER_BUILD", ""),
             "model": self._model,
+            "role": "sub" if self.is_sub else "main",
             "outcome": run.outcome,
             # the word "error" on its own is not actionable: a provider 400, a
             # crashed callback and a tool calling sys.exit would all read alike
@@ -835,6 +841,10 @@ class Agent:
             return f"Error executing {tc.name}: {e}"
         if isinstance(out, ToolRefused):
             meta["refused"] = True
+        if isinstance(out, SubagentTruncated):
+            # the child's truncation survives its own except handler as plain
+            # text; name it here so the tool_result line carries the type
+            meta["error_type"] = "TruncatedOutput"
         return out
 
     @staticmethod

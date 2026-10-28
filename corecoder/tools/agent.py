@@ -10,7 +10,7 @@ The sub-agent runs to completion and returns a text summary.
 
 from typing import ClassVar
 
-from .base import Tool
+from .base import SubagentTruncated, Tool
 
 
 class AgentTool(Tool):
@@ -40,7 +40,7 @@ class AgentTool(Tool):
             return "Error: agent tool not initialized (no parent agent)"
 
         # import here to avoid circular dep
-        from ..agent import Agent
+        from ..agent import Agent, TruncatedOutput
 
         parent = self._parent_agent
         sub = Agent(
@@ -60,6 +60,9 @@ class AgentTool(Tool):
             # reuse whatever the parent already searched for, so a deferred MCP
             # tool stays callable in the child without a second search round
             loaded_names=getattr(parent, "_loaded", None),
+            # G5: its run_summary must read role=sub, or summing the audit
+            # rows double-counts the share the parent's delta already carries
+            is_sub=True,
         )
 
         # a sub-agent failure comes back as text, never propagates into the parent
@@ -74,6 +77,11 @@ class AgentTool(Tool):
             if len(result) > 5000:
                 result = result[:4500] + "\n... (sub-agent output truncated)"
             return f"[Sub-agent completed]\n{result}"
+        except TruncatedOutput as e:
+            # G5: a child cut off mid-stream is not a generic error; the
+            # marker makes the parent's tool_result line read
+            # error_type=TruncatedOutput instead of an empty field
+            return SubagentTruncated(f"Sub-agent truncated: {e}")
         except Exception as e:  # noqa: BLE001
             return f"Sub-agent error: {e}"
         finally:

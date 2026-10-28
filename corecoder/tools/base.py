@@ -16,6 +16,15 @@ class ToolRefused(str):
     "the tool ran and returned a warning"."""
 
 
+class SubagentTruncated(str):
+    """A sub-agent result that died on repeated output truncation (G5).
+
+    Same trick as :class:`ToolRefused`: plain text for the model and the
+    hooks, while the audit layer marks the parent's ``tool_result`` line with
+    ``error_type=TruncatedOutput`` instead of letting the child's failure
+    read like any other answer."""
+
+
 class Tool(ABC):
     """Minimal tool interface. Subclass this to add new capabilities."""
 

@@ -399,7 +399,9 @@ class TestTruncationIsLoud:
         monkeypatch.setattr(Agent, "chat", boom)
         out = tool.execute("do the thing")
 
-        assert out.startswith("Sub-agent error")
+        # G5: TruncatedOutput gets its own words - a child that was cut off
+        # mid-stream is not the same failure as a child that crashed
+        assert out.startswith("Sub-agent truncated")
         assert "[Sub-agent completed]" not in out
 
 

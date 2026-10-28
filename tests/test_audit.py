@@ -1003,6 +1003,69 @@ def test_run_summary_names_the_error_that_ended_the_run():
     assert _fields(_lines(out2, "run_summary")[0])["error_type"] == "None"
 
 
+def test_run_summary_marks_main_and_sub_roles():
+    """Cost accounting (G5): a sub-agent shares the parent's llm and tracer, so
+    one trace carries a run_summary per agent. Without a role to tell them
+    apart, summing the lines double-counted the sub-agent's whole share -
+    measured on R4 at 0.001545 against a true total of 0.001031, because the
+    parent's cost delta already includes everything the child spent.
+    """
+    from corecoder.tools.agent import AgentTool
+
+    out = _capture()
+    agent = _agent(
+        [AgentTool(), SpyTool()],
+        [_turn(_tc("agent", "a1", {"task": "sub"})),   # parent delegates
+         LLMResponse(content="sub done"),              # sub's one and only round
+         LLMResponse(content="parent done")],          # parent wraps up
+    )
+    assert agent.chat("go") == "parent done"
+
+    summaries = [_fields(ln) for ln in _lines(out, "run_summary")]
+    assert [s["role"] for s in summaries] == ["sub", "main"]
+
+
+def test_truncated_sub_agent_is_marked_on_the_tool_result_line():
+    """A sub-agent that died on repeated truncation must not flatten into a
+    generic error string (G5).
+
+    ``sub.chat`` raises TruncatedOutput after two truncated rounds, and the
+    catch-all handler used to report it as "Sub-agent error" text while the
+    audit's tool_result line kept an empty error_type - indistinguishable
+    from a normal answer. The dedicated catch names it in both places: the
+    history text opens with "Sub-agent truncated:" and the line carries
+    error_type=TruncatedOutput.
+    """
+    from corecoder.tools.agent import AgentTool
+
+    out = _capture()
+    agent = _agent(
+        [AgentTool(), SpyTool()],
+        [
+            _turn(_tc("agent", "a1", {"task": "sub"})),
+            LLMResponse(finish_reason="length",
+                        tool_calls=[_tc("spy", "s1")]),
+            LLMResponse(finish_reason="length",
+                        tool_calls=[_tc("spy", "s2")]),
+            LLMResponse(content="parent done"),
+        ],
+    )
+    assert agent.chat("go") == "parent done"
+
+    results = [f for f in (_fields(ln) for ln in _lines(out, "tool_result"))
+               if f["tool"] == "agent"]
+    assert len(results) == 1
+    assert results[0]["error_type"] == "TruncatedOutput"
+    assert results[0]["outcome"] == "error"
+
+    replies = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+    assert replies and replies[0].startswith("Sub-agent truncated:")
+
+    summaries = [_fields(ln) for ln in _lines(out, "run_summary")]
+    assert [s["role"] for s in summaries] == ["sub", "main"]
+    assert summaries[0]["outcome"] == "truncated"
+
+
 def test_run_summary_carries_version_and_build(monkeypatch):
     from corecoder import __version__
 
