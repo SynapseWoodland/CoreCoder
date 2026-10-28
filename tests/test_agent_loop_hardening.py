@@ -10,9 +10,10 @@ any exception escaping a round must still leave every tool_call answered.
 Group 11 pins M3: a provider context-length 400 collapses the history once
 and retries once, and the local estimate counts the fixed request overhead.
 Group 12 pins M4: every tool result is clamped and redacted before it enters
-the history, and read_file refuses oversized files. Group 13 pins B1 of the
+the history, and read_file refuses oversized files. Group 13 pins B1/B2 of the
 observability re-check: a retried round must report the estimate of the request
-that was actually answered, in both sinks.
+that was actually answered, and a round that came back empty must leave a trace
+instead of being reported as a plain answer.
 """
 
 import io
@@ -983,3 +984,44 @@ class TestToolResultGovernance:
         for reply in replies:
             assert len(reply) <= 15_200
             assert "truncated:" in reply
+
+
+# ─── 13. B2: an empty answer must not read as a plain answer ───────────────
+
+class TestEmptyAnswerIsLoud:
+    """The provider used for the re-check clips an over-long request silently
+    instead of answering 400, so the round came back ``finish_reason=length``
+    with no text and no tool call. The loop returned the empty string as the
+    answer, wrote ``outcome=answer`` and emitted no event at all, so a user
+    saw a blank screen and the ledger saw a success (02-verdict.md, gap #5).
+    """
+
+    @staticmethod
+    def _agent() -> Agent:
+        return Agent(
+            llm=ScriptedLLM([LLMResponse(content="", finish_reason="length")]),
+            tools=[],
+        )
+
+    def test_one_shot_explains_an_empty_answer(self, capsys):
+        from corecoder import cli
+
+        # no SystemExit: an empty answer is not a failed run, but it must not
+        # pass for a finished one either
+        cli._run_once(self._agent(), "go")
+
+        captured = capsys.readouterr()
+        assert "empty answer" in captured.err
+        assert "max_tokens" in captured.err
+
+    def test_repl_explains_an_empty_answer_and_stays_alive(self, monkeypatch, capsys):
+        from tests.conftest import repl_with
+
+        # "/help" is the liveness probe: the loop has to survive the blank turn
+        # to serve the next command at all. ("quit" breaks straight out, so the
+        # farewell only ever prints on the EOF path.)
+        repl_with(monkeypatch, self._agent(), ["go", "/help", "quit"])
+
+        captured = capsys.readouterr()
+        assert "empty answer" in captured.err
+        assert "CoreCoder Help" in captured.out

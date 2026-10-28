@@ -144,6 +144,22 @@ def _ask_permission(tool_name: str, arguments: dict) -> str:
     return "deny"
 
 
+def _warn_empty_answer(answer) -> None:
+    """Say the blank screen out loud, without calling the run a failure.
+
+    A round cut off at the output cap used to come back as an empty string with
+    no event anywhere: the audit line and the trace now carry `empty_response`
+    for it, and the terminal needs the same hint or the user simply sees
+    nothing. Exit status stays 0 - nothing went wrong that a retry cannot fix.
+    """
+    if (answer or "").strip():
+        return
+    err_console.print(
+        "[yellow]The model returned an empty answer.[/yellow] "
+        "Raise max_tokens (CORECODER_MAX_TOKENS) or shorten the request."
+    )
+
+
 def _run_once(agent: Agent, prompt: str):
     """Non-interactive: run one prompt and exit."""
     perm = agent.permission
@@ -161,7 +177,8 @@ def _run_once(agent: Agent, prompt: str):
         err_console.print(f"[dim]{tok}[/dim]", end="")
 
     try:
-        agent.chat(prompt, on_token=on_token, on_tool=on_tool, on_reasoning=on_reasoning)
+        answer = agent.chat(prompt, on_token=on_token, on_tool=on_tool,
+                            on_reasoning=on_reasoning)
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         console.print("[dim]A parallel tool call already running may still finish; "
@@ -180,6 +197,7 @@ def _run_once(agent: Agent, prompt: str):
         console.print(f"\n[red]Error: {e}[/red]")
         sys.exit(1)
     print()
+    _warn_empty_answer(answer)
 
 
 def _repl(agent: Agent, config: Config):
@@ -314,6 +332,7 @@ def _run_turn(agent: Agent, prompt: str) -> None:
         else:
             # response wasn't streamed (came after tool calls)
             console.print(Markdown(response))
+        _warn_empty_answer(response)
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         console.print("[dim]A parallel tool call already running may still finish; "

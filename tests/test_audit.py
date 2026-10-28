@@ -447,6 +447,76 @@ def test_context_overflow_recovery_is_logged():
     assert _fields(events[0])["error_type"] == "BadRequestError"
 
 
+def test_empty_answer_is_recorded():
+    """B2: a round that was cut short and produced no text must say so.
+
+    A provider that clips an over-long request silently never raises, so this
+    path ended `outcome=answer` with an empty body and no event at all: the
+    gate below only fires for truncated rounds that carry tool calls.
+    """
+    agent = _agent([SpyTool()], [])
+    agent.llm = ScriptedLLM([LLMResponse(content="", finish_reason="length")])
+    out = _capture()
+
+    assert agent.chat("go") == ""
+    events = _lines(out, "empty_response")
+    assert len(events) == 1
+    fields = _fields(events[0])
+    assert fields["round"] == "1"
+    assert fields["finish_reason"] == "length"
+    assert fields["completion_tokens"] == "0"
+    # nothing was cut from a tool call, so the M2 gate must stay quiet
+    assert _lines(out, "output_truncated") == []
+    summary = _fields(_lines(out, "run_summary")[0])
+    assert summary["outcome"] == "answer"
+    assert summary["empty"] == "1"
+
+
+def test_silent_clip_is_recorded():
+    """B2: reported usage far below our own estimate means the request was cut.
+
+    The re-check measured an estimate of 1,457,607 against a reported 721,600
+    prompt tokens with the model still answering normally: the window was
+    clipped upstream and nothing in either stream named it.
+    """
+    agent = _agent([SpyTool()], [])
+    agent.llm = ScriptedLLM([
+        LLMResponse(content="short answer", finish_reason="stop",
+                    prompt_tokens=200, completion_tokens=5, usage_reported=True),
+    ])
+    agent.messages = [{"role": "user", "content": "y" * 20000} for _ in range(4)]
+    out = _capture()
+
+    assert agent.chat("more") == "short answer"
+    events = _lines(out, "context_suspected_clip")
+    assert len(events) == 1
+    fields = _fields(events[0])
+    assert fields["prompt_tokens"] == "200"
+    # the reference is the very number the round's own line reported
+    assert fields["estimated_prompt"] == _fields(_lines(out, "llm_call")[0])["estimated_prompt"]
+    assert int(fields["estimated_prompt"]) > 200
+    assert float(fields["ratio"]) < 0.6
+
+
+def test_normal_answer_stays_quiet():
+    """B2 must not turn every short reply into an incident.
+
+    A stopped round with text and usage that matches the estimate reports
+    nothing: an empty answer is marked on the summary, a clip is not guessed.
+    """
+    agent = _agent([SpyTool()], [])
+    agent.llm = ScriptedLLM([
+        LLMResponse(content="fine", finish_reason="stop", prompt_tokens=100_000,
+                    completion_tokens=8, usage_reported=True),
+    ])
+    out = _capture()
+
+    assert agent.chat("hi") == "fine"
+    assert _lines(out, "empty_response") == []
+    assert _lines(out, "context_suspected_clip") == []
+    assert "empty" not in _fields(_lines(out, "run_summary")[0])
+
+
 # ─── 5. provider fallbacks and retries ─────────────────────────────────────
 
 def test_provider_param_fallbacks_are_logged():

@@ -62,6 +62,9 @@ class _RunStats:
     tokens_in: int = 0
     tokens_out: int = 0
     usage_reported: bool = True
+    # rounds that came back with nothing readable in them. Counted only when it
+    # actually happens, so a normal run's summary carries no misleading zero
+    empty: int = 0
     # what the run delivered; the root span shows it as the trace's output, so
     # the trace list can answer "what did this run give back" at all
     answer: str | None = None
@@ -337,6 +340,7 @@ class Agent:
             if not resp.tool_calls:
                 self.messages.append(resp.message)
                 run.outcome = "answer"
+                self._notice_empty_answer(resp, current_round, run)
                 return resp.content
 
             self._tool_round(resp, on_tool, current_round, run)
@@ -394,7 +398,7 @@ class Agent:
                           [{"content": self._schema_json_str()}]), **metrics)
             call.record(metrics)
             call.capture_output(resp.content or "", _tool_call_view(resp))
-        self._account_usage(run, resp)
+        self._account_usage(run, resp, estimated_prompt, retried)
         return resp
 
     def _chat_once(self, on_token, on_reasoning):
@@ -427,16 +431,19 @@ class Agent:
                           messages_after=len(self.messages), error_type=error_type)
         return self._chat_once(on_token, on_reasoning), after_tokens
 
-    def _account_usage(self, run, resp) -> None:
+    def _account_usage(self, run, resp, estimated_prompt: int = 0,
+                       retried: bool = False) -> None:
         """Fold one call's usage into the run totals, then enforce the budget.
 
         Only reported usage becomes a total; unreported zeros stay unknown. The
         budget check runs after accounting so the round that tips the scale is
-        the one that trips the fuse.
+        the one that trips the fuse. The reported usage is also compared against
+        what this round estimated, which is the only sign a silent clip leaves.
         """
         if resp.usage_reported:
             run.tokens_in += resp.prompt_tokens
             run.tokens_out += resp.completion_tokens
+            self._notice_clip(resp, estimated_prompt, retried)
         else:
             run.usage_reported = False
         self._check_budget(run)
@@ -482,6 +489,37 @@ class Agent:
                 "(CORECODER_MAX_TOKENS) or reduce the request"
             )
 
+    def _notice_empty_answer(self, resp, current_round: int, run) -> None:
+        """Mark an answer that came back with nothing readable in it.
+
+        The truncation gate above only fires for rounds carrying tool calls, so
+        a zero-text round used to end as a plain ``outcome=answer``: the terminal
+        showed a blank line and the ledger showed a success.
+        """
+        if resp.finish_reason != "length" or (resp.content or "").strip():
+            return
+        run.empty += 1
+        self._record("empty_response", level=logging.WARNING,
+                     round=current_round, finish_reason=resp.finish_reason,
+                     completion_tokens=resp.completion_tokens)
+
+    def _notice_clip(self, resp, estimated_prompt: int, retried: bool) -> None:
+        """Name the request whose reported usage is far below our own estimate.
+
+        A provider that trims an over-long request says nothing: it answers
+        normally and only the usage betrays it. Measured on the windows that
+        found this, 1,457,607 estimated against 721,600 reported (0.49) and
+        3,237,018 against 1,048,570 (0.32).
+        """
+        if retried or estimated_prompt <= 0 or resp.prompt_tokens <= 0:
+            return  # a retried round is already measured post-collapse
+        ratio = resp.prompt_tokens / estimated_prompt
+        if ratio >= _clip_ratio_alert():
+            return
+        self._record("context_suspected_clip", level=logging.WARNING,
+                     estimated_prompt=estimated_prompt,
+                     prompt_tokens=resp.prompt_tokens, ratio=round(ratio, 4))
+
     def _record(self, name: str, level: int = logging.INFO, **fields) -> None:
         """One event for both sinks: the audit line and the run's span."""
         log_event(name, level=level, **fields)
@@ -504,6 +542,8 @@ class Agent:
             }
             if run.error_type is not None:
                 fields["error"] = run.error_type
+            if run.empty:
+                fields["empty"] = run.empty
             if run.answer is not None:
                 # the answer is content, so the capture switch filters it downstream
                 # like any other text: nothing here decides whether it is recorded
@@ -515,25 +555,29 @@ class Agent:
 
     def _log_run_summary(self, run) -> None:
         from . import __version__
-        log_event(
-            "run_summary",
-            session=self.session_id,
-            version=__version__,
-            build=os.getenv("CORECODER_BUILD", ""),
-            model=self._model,
-            outcome=run.outcome,
+        summary = {
+            "session": self.session_id,
+            "version": __version__,
+            "build": os.getenv("CORECODER_BUILD", ""),
+            "model": self._model,
+            "outcome": run.outcome,
             # the word "error" on its own is not actionable: a provider 400, a
             # crashed callback and a tool calling sys.exit would all read alike
-            error_type=run.error_type,
-            rounds=run.rounds,
-            tool_calls=run.tool_calls,
-            tools_executed=run.executed,
-            tokens_in=run.tokens_in,
-            tokens_out=run.tokens_out,
-            usage_reported=run.usage_reported,
-            cost_usd=_cost_delta(run.cost_before, self._estimated_cost()),
-            duration_ms=round((time.perf_counter() - run.started) * 1000, 3),
-        )
+            "error_type": run.error_type,
+            "rounds": run.rounds,
+            "tool_calls": run.tool_calls,
+            "tools_executed": run.executed,
+            "tokens_in": run.tokens_in,
+            "tokens_out": run.tokens_out,
+            "usage_reported": run.usage_reported,
+            "cost_usd": _cost_delta(run.cost_before, self._estimated_cost()),
+            "duration_ms": round((time.perf_counter() - run.started) * 1000, 3),
+        }
+        if run.empty:
+            # the outcome word stays "answer" - an empty reply is still a reply -
+            # but the summary must be able to tell the two apart on its own
+            summary["empty"] = run.empty
+        log_event("run_summary", **summary)
 
     def _answer_truncated_tool_calls(self, resp) -> None:
         """M2: record a truncated response and reply to every tool call with a
@@ -1004,6 +1048,21 @@ def _result_fields(decision: str, meta: dict) -> dict:
         "redacted": bool(meta.get("redacted", False)),
         "error_type": meta.get("error_type", ""),
     }
+
+
+def _clip_ratio_alert() -> float:
+    """Reported-vs-estimated prompt tokens below which a clip is suspected.
+
+    ``CORECODER_CLIP_RATIO_ALERT`` overrides it; anything outside (0, 1] falls
+    back to the default rather than silencing the check, because a typo here
+    would otherwise remove the only error surface a silent clip has.
+    """
+    raw = os.getenv("CORECODER_CLIP_RATIO_ALERT", "").strip()
+    try:
+        value = float(raw) if raw else 0.6
+    except ValueError:
+        return 0.6
+    return value if 0 < value <= 1 else 0.6
 
 
 def _call_metrics(resp, call_started: float, cost_before, cost_after,
