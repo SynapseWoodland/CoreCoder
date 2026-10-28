@@ -10,9 +10,12 @@ any exception escaping a round must still leave every tool_call answered.
 Group 11 pins M3: a provider context-length 400 collapses the history once
 and retries once, and the local estimate counts the fixed request overhead.
 Group 12 pins M4: every tool result is clamped and redacted before it enters
-the history, and read_file refuses oversized files.
+the history, and read_file refuses oversized files. Group 13 pins B1 of the
+observability re-check: a retried round must report the estimate of the request
+that was actually answered, in both sinks.
 """
 
+import io
 import json
 from types import SimpleNamespace
 from typing import ClassVar
@@ -21,6 +24,7 @@ from unittest import mock
 import pytest
 from openai import BadRequestError
 
+from corecoder import audit
 from corecoder.agent import Agent, TruncatedOutput
 from corecoder.context import ContextManager, estimate_tokens
 from corecoder.demo import ScriptedLLM
@@ -69,6 +73,29 @@ def _mock_llm(*streams):
     llm.client = mock.Mock()
     llm.client.chat.completions.create.side_effect = list(streams)
     return llm
+
+
+def _audit_capture(monkeypatch) -> io.StringIO:
+    """An in-memory audit sink for the loop tests that read the lines back.
+
+    ``log_event`` drops every line while ``CORECODER_AUDIT`` is off, and the
+    sink lives in module state, so both are set here; the suite-wide fixture in
+    ``conftest.py`` resets it again after the test.
+    """
+    monkeypatch.setenv("CORECODER_AUDIT", "1")
+    stream = io.StringIO()
+    audit.configure_audit(stream=stream)
+    return stream
+
+
+def _audit_fields(stream, event: str) -> list[dict]:
+    """Every line of one event, as a field dict (same shape as test_audit.py)."""
+    rows = []
+    for line in stream.getvalue().splitlines():
+        if line.startswith(f"event={event} "):
+            rows.append(dict(token.split("=", 1) for token in line.split()[1:]
+                             if "=" in token))
+    return rows
 
 
 class SpyTool(Tool):
@@ -748,6 +775,73 @@ class TestContextOverflowRecovery:
         # history it is added to
         assert compress.call_count == 1
         assert compress.call_args.kwargs["fixed_tokens"] == before
+
+    def test_retried_round_logs_the_post_collapse_estimate(self, monkeypatch):
+        """B1: a retried round must describe the request that got answered.
+
+        ``_model_round`` estimates before the call, and ``_recover_overflow``
+        rewrites ``self.messages`` before re-issuing, so the audit line paired
+        the pre-collapse snapshot with the post-retry usage. The drill window
+        read ``estimated_prompt=1457607`` against ``prompt_tokens=1585`` (919x)
+        - the estimate was never that bad, the pair was just wrong.
+        """
+        out = _audit_capture(monkeypatch)
+        llm = CountingLLM(
+            _bad_request("This model's maximum context length is 8 tokens"),
+            LLMResponse(content="recovered", prompt_tokens=1585,
+                        completion_tokens=14, usage_reported=True),
+        )
+        agent = self._agent(llm)
+        agent.messages = [{"role": "user", "content": "x" * 4000} for _ in range(6)]
+        before = estimate_tokens(agent.messages)
+
+        with mock.patch.object(agent.context, "_get_summary", return_value="summary"):
+            assert agent.chat("go") == "recovered"
+
+        retried = [row for row in _audit_fields(out, "llm_call")
+                   if row.get("retried") == "True"]
+        assert len(retried) == 1
+        [overflow] = _audit_fields(out, "context_overflow")
+        estimated = int(retried[0]["estimated_prompt"])
+
+        # the number that ships must be the one `_recover_overflow` measured
+        # after the collapse, not the one taken before the first attempt
+        assert estimated == int(overflow["estimated_after"])
+        assert estimated < before
+
+    def test_both_sinks_report_the_same_post_collapse_estimate(self, monkeypatch,
+                                                               tmp_path):
+        """B1: the audit line and the round's span must never diverge again.
+
+        Both sinks read the same stale local today, so they agree on a wrong
+        number; folding the estimate into the shared metrics dict makes the
+        equality below structural rather than a coincidence of one call site.
+        """
+        out = _audit_capture(monkeypatch)
+        trace_path = tmp_path / "rounds.jsonl"
+        llm = CountingLLM(
+            _bad_request("This model's maximum context length is 8 tokens"),
+            LLMResponse(content="recovered"),
+        )
+        agent = Agent(llm=llm, tools=[], max_context_tokens=200_000,
+                      tracer=JsonlTracer(trace_path))
+        agent.messages = [{"role": "user", "content": "x" * 4000} for _ in range(6)]
+
+        with mock.patch.object(agent.context, "_get_summary", return_value="summary"):
+            assert agent.chat("go") == "recovered"
+
+        records = [json.loads(line) for line in
+                   trace_path.read_text(encoding="utf-8").splitlines()]
+        [round_span] = [r for r in records if r["name"] == "llm.round"]
+        agent.tracer.close()
+
+        [overflow] = _audit_fields(out, "context_overflow")
+        retried = [row for row in _audit_fields(out, "llm_call")
+                   if row.get("retried") == "True"]
+        assert len(retried) == 1
+        expected = int(overflow["estimated_after"])
+        assert int(round_span["attrs"]["estimated_prompt"]) == expected
+        assert int(retried[0]["estimated_prompt"]) == expected
 
 
 # ─── 12. M4: tool results are clamped and redacted before history ───────────

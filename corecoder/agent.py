@@ -379,12 +379,17 @@ class Agent:
                 # re-issue. A too-short history cannot free enough to help.
                 if not is_context_length_error(e) or len(self.messages) <= 4:
                     raise
-                resp = self._recover_overflow(e, on_token, on_reasoning)
+                resp, after_tokens = self._recover_overflow(
+                    e, on_token, on_reasoning)
                 retried = True
+                # what the provider answered is the collapsed request, so the
+                # number that ships must be the one measured after the collapse:
+                # pairing the pre-rejection snapshot with this usage is the 919x
+                # dirty pair the re-check window read in both sinks
+                estimated_prompt = after_tokens
             metrics = _call_metrics(resp, call_started, call_cost_before,
-                                    self._estimated_cost(), retried)
+                                    self._estimated_cost(), retried, estimated_prompt)
             log_event("llm_call", round=current_round, model=self._model,
-                      estimated_prompt=estimated_prompt,
                       schema_tokens=estimate_tokens(
                           [{"content": self._schema_json_str()}]), **metrics)
             call.record(metrics)
@@ -398,7 +403,12 @@ class Agent:
             on_token=on_token, on_reasoning=on_reasoning)
 
     def _recover_overflow(self, error, on_token, on_reasoning):
-        """The provider called the request too long: collapse once and retry."""
+        """The provider called the request too long: collapse once and retry.
+
+        Returns the response and the estimate of the request that was actually
+        re-issued, so the caller can report the number this reply belongs to
+        rather than the one that got rejected.
+        """
         before_messages = len(self.messages)
         before_tokens = estimate_tokens(self.messages) + self._fixed_prompt_tokens()
         self.context.force_collapse(self.messages, self.llm)
@@ -415,7 +425,7 @@ class Agent:
         # the trace event stays without the estimates: a span event is a marker
         self._trace.event("context_overflow", messages_before=before_messages,
                           messages_after=len(self.messages), error_type=error_type)
-        return self._chat_once(on_token, on_reasoning)
+        return self._chat_once(on_token, on_reasoning), after_tokens
 
     def _account_usage(self, run, resp) -> None:
         """Fold one call's usage into the run totals, then enforce the budget.
@@ -997,9 +1007,15 @@ def _result_fields(decision: str, meta: dict) -> dict:
 
 
 def _call_metrics(resp, call_started: float, cost_before, cost_after,
-                  retried: bool) -> dict:
-    """The fields one model call reports to both sinks."""
+                  retried: bool, estimated_prompt: int) -> dict:
+    """The fields one model call reports to both sinks.
+
+    ``estimated_prompt`` belongs here and not at the call site on purpose: the
+    audit line and the round's span must read the same number out of the same
+    dict, otherwise one sink can be repaired while the other keeps a stale one.
+    """
     return {
+        "estimated_prompt": estimated_prompt,
         "prompt_tokens": resp.prompt_tokens if resp.usage_reported else None,
         "completion_tokens": resp.completion_tokens if resp.usage_reported else None,
         "usage_reported": resp.usage_reported,
