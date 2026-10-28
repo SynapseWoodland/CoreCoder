@@ -146,6 +146,26 @@ def _adapt_rejected_param(params: dict, exc: BadRequestError) -> str | None:
     return None
 
 
+# A 400 that is about the model name itself rather than a request field. The
+# provider we dogfood answers a bad model with 'Unsupported model <name>'; the
+# OpenAI dialect says the model 'does not exist or you do not have access'.
+# Dropping stream_options cannot fix either, so the fallback must not fire here.
+_MODEL_IDENTITY_HINTS = (
+    "unsupported model",
+    "does not exist",
+    "model not found",
+    "invalid model",
+    "unknown model",
+    "no access to",
+)
+
+
+def _rejects_model_identity(exc: BaseException) -> bool:
+    """True when a 400 names the model itself, not a request parameter."""
+    message = str(exc).lower()
+    return any(hint in message for hint in _MODEL_IDENTITY_HINTS)
+
+
 def _log_retry(stage: str, attempt: int, status, error_type: str) -> None:
     log_event("llm_retry", stage=stage, attempt=attempt,
               status=status if status is not None else "", error_type=error_type)
@@ -165,6 +185,10 @@ def _is_retryable_error(exc: APIError) -> bool:
 
 
 class LLM:
+    # whether the provider accepts the OpenAI stream_options extension; flipped
+    # to False on the first nameless 400 so the key is never re-sent afterward
+    _stream_options_supported = True
+
     def __init__(
         self,
         model: str,
@@ -273,7 +297,8 @@ class LLM:
         }
         if tools:
             params["tools"] = tools
-        params["stream_options"] = {"include_usage": True}
+        if self._stream_options_supported:
+            params["stream_options"] = {"include_usage": True}
         return params
 
     def _open_stream(self, params: dict, attempt: int):
@@ -281,10 +306,11 @@ class LLM:
 
         Provider-dialect fallbacks. A 400 that quotes a parameter is adapted
         (newer OpenAI models take max_completion_tokens, default temperature
-        only); a 400 that names nothing drops stream_options once, matching
-        the previous single-fallback behavior for servers that reject the
-        OpenAI extension silently. The loop is bounded by the param set, and
-        an unrecognized 400 re-raises instead of doubling _call_with_retry's
+        only). A 400 that names nothing specific drops stream_options once, per
+        instance - for servers that reject the OpenAI extension silently; once
+        learned, _request_params stops re-adding it. A 400 that names the model
+        itself is not a parameter problem, so it re-raises without resending.
+        An unrecognized 400 re-raises instead of doubling _call_with_retry's
         exhausted retries. LiteLLM never lands here: drop_params strips
         unsupported keys on that path.
         """
@@ -294,12 +320,20 @@ class LLM:
             except BadRequestError as e:
                 kind = _adapt_rejected_param(params, e)
                 if kind:
-                    log_event("provider_fallback", kind=kind, attempt=attempt)
+                    log_event("provider_fallback", kind=kind, attempt=attempt,
+                              error_type=type(e).__name__,
+                              http_status=getattr(e, "status_code", ""))
                     continue
-                if "stream_options" not in params:
-                    raise
-                params.pop("stream_options")
-                log_event("provider_fallback", kind="stream_options", attempt=attempt)
+                if (self._stream_options_supported
+                        and "stream_options" in params
+                        and not _rejects_model_identity(e)):
+                    self._stream_options_supported = False
+                    params.pop("stream_options")
+                    log_event("provider_fallback", kind="unnamed_param_fallback",
+                              attempt=attempt, error_type=type(e).__name__,
+                              http_status=getattr(e, "status_code", ""))
+                    continue
+                raise
 
     def _drain(self, stream, on_token, on_reasoning) -> LLMResponse:
         """Consume one stream into an LLMResponse."""

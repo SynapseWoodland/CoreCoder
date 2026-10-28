@@ -540,7 +540,10 @@ def test_provider_param_fallbacks_are_logged():
     ]
     assert llm2.chat(messages=[{"role": "user", "content": "hi"}]).content == "ok"
     fallback = _lines(out2, "provider_fallback")
-    assert _fields(fallback[0])["kind"] == "stream_options"
+    # B3: a nameless 400 keeps a single fallback, but the kind now says honestly
+    # what was dropped and the error surface is recorded instead of guessed
+    assert _fields(fallback[0])["kind"] == "unnamed_param_fallback"
+    assert _fields(fallback[0])["error_type"] == "BadRequestError"
 
 
 def test_mid_stream_retry_is_logged(monkeypatch):

@@ -540,6 +540,44 @@ class TestLLMParamFallback:
         retry_kwargs = create.call_args_list[-1][1]
         assert "max_completion_tokens" in retry_kwargs
 
+    def test_model_name_400_does_not_pop_stream_options(self):
+        """B3/G4: a 400 that names a model - not a request field - must not
+        trigger the stream_options fallback.
+
+        Dropping that key cannot fix a bad model name, yet the old catch-all
+        resent the whole doomed request anyway, so every broken-model run
+        stamped a spurious provider_fallback row into the audit.
+        """
+        llm = self._make_llm()
+        create = llm.client.chat.completions.create
+        create.side_effect = self._bad_request(
+            "Error code: 400 - The model `corecoder-no-such-model-xyz` "
+            "does not exist or you do not have access to it.")
+        with pytest.raises(BadRequestError):
+            llm.chat(messages=[{"role": "user", "content": "hi"}])
+        # the request must fail on the first attempt, params untouched
+        assert create.call_count == 1
+        assert "stream_options" in create.call_args_list[0][1]
+
+    def test_unnamed_400_falls_back_only_once(self):
+        """B3/G4: the nameless-400 drop is a learn-once signal.
+
+        After one stream_options drop the instance must stop re-adding the key,
+        so a later nameless 400 costs no second fallback resend.
+        """
+        llm = self._make_llm()
+        create = llm.client.chat.completions.create
+        create.side_effect = [
+            self._bad_request("Bad request"),  # call 1 attempt 1: nameless 400
+            self._stream(),                    # call 1 attempt 2: after drop, ok
+            self._stream(),                    # call 2 attempt 1: ok, no resend
+        ]
+        assert llm.chat(messages=[{"role": "user", "content": "hi"}]).content == "ok"
+        assert llm.chat(messages=[{"role": "user", "content": "hi"}]).content == "ok"
+        # the second chat learned the key is unsupported and never re-added it
+        assert "stream_options" not in create.call_args_list[-1][1]
+        assert len(create.call_args_list) == 3
+
 
 # ---------------------------------------------------------------------------
 # LLM.chat() reasoning passthrough and mid-stream retry
