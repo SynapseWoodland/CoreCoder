@@ -268,7 +268,7 @@ def test_tool_decision_and_result_are_logged_per_call():
     assert decision["call_id"] == "abc"
     assert decision["decision"] == "execute"
     assert decision["args_chars"] == "0"
-    assert float(decision["decision_ms"]) >= 0  # sub-ms precision, same as duration_ms
+    assert "decision_ms" in decision  # value pinned against a fixed clock below
 
     result = _fields(_lines(out, "tool_result")[0])
     assert result["call_id"] == "abc"
@@ -278,6 +278,28 @@ def test_tool_decision_and_result_are_logged_per_call():
     assert result["redacted"] == "False"
     assert result["error_text"] == "False"
     assert result["error_type"] == '""'  # empty values are JSON-quoted, not dropped
+
+
+def test_decision_ms_is_measured_from_the_clock(monkeypatch):
+    """decision_ms must be a real clock delta, not a field that only exists.
+
+    The assertion this replaced (``float(decision_ms) >= 0``) was always true,
+    even for a value collapsed to a misleading 0. Feed ``time.perf_counter`` a
+    fixed timeline straddling one decision and pin the logged value to the exact
+    sub-millisecond delta -- proving the field is wired to the clock at all.
+    """
+    # _settle_and_run reads the clock four times: decision start/end, then exec
+    # start/end; only the first pair feeds decision_ms
+    ticks = iter([1000.0, 1000.0005, 2000.0, 2000.001])
+    monkeypatch.setattr("corecoder.agent.time.perf_counter", lambda: next(ticks))
+    agent = _agent([SpyTool()], [])
+    out = _capture()
+
+    agent._settle_and_run(_tc(call_id="t9"), 0, SimpleNamespace(executed=0))
+
+    decision = _fields(_lines(out, "tool_decision")[0])
+    assert decision["decision_ms"] == "0.5"  # (1000.0005 - 1000.0) * 1000, sub-ms
+    assert float(decision["decision_ms"]) > 0
 
 
 def test_slowest_tool_is_identifiable_and_round_is_omitted_when_unknown():

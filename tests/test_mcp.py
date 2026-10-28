@@ -4,6 +4,7 @@ The fake server is a stdlib-only Python script run via sys.executable, so
 these tests need no shell and run the same on Windows.
 """
 
+import io
 import json
 import logging
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from corecoder import audit
 from corecoder import mcp
 from corecoder.agent import Agent
 from corecoder.demo import ScriptedLLM
@@ -224,6 +226,61 @@ def test_an_unstartable_server_is_skipped_with_one_warning(tmp_path, caplog):
         assert load_mcp_tools(cfg) == []
     assert len(caplog.records) == 1
     assert "ghost" in caplog.records[0].getMessage()
+
+
+def _audit_stream(monkeypatch):
+    """A live audit sink in memory; the audit logger propagates nowhere else."""
+    monkeypatch.setenv("CORECODER_AUDIT", "1")
+    stream = io.StringIO()
+    audit.configure_audit(stream=stream)
+    return stream
+
+
+def _event_lines(stream, event):
+    return [ln for ln in stream.getvalue().splitlines() if ln.startswith(f"event={event} ")]
+
+
+def test_unstartable_server_leaves_an_audit_line(tmp_path, monkeypatch):
+    """An MCP server that will not start is more than a warning the operator
+    may never see: it must leave one structured line in the audit stream, or
+    the whole failure is invisible on the observation face."""
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {"ghost": {"command": "not-a-real-binary-xyz"}}}))
+    out = _audit_stream(monkeypatch)
+
+    assert load_mcp_tools(cfg) == []
+
+    skipped = _event_lines(out, "mcp_skipped")
+    assert len(skipped) == 1
+    fields = dict(t.split("=", 1) for t in skipped[0].split() if "=" in t)
+    assert fields["name"] == "ghost"
+    assert fields["error_type"]  # the exception class that killed the handshake
+
+
+def test_broken_config_leaves_an_audit_line(tmp_path, monkeypatch):
+    """A config file that never parses is a startup failure too, and gets an
+    audit line rather than only the log.warning."""
+    bad = tmp_path / "mcp.json"
+    bad.write_text("{not json", encoding="utf-8")
+    out = _audit_stream(monkeypatch)
+
+    assert load_mcp_tools(bad) == []
+
+    errors = _event_lines(out, "mcp_config_error")
+    assert len(errors) == 1
+    fields = dict(t.split("=", 1) for t in errors[0].split() if "=" in t)
+    assert fields["error_type"] == "JSONDecodeError"
+
+
+def test_a_healthy_mcp_run_leaves_no_failure_line(tmp_path, monkeypatch, mcp_config):
+    """Negative control: the audit line is a failure signal, not chatter. A
+    config that loads cleanly must not emit mcp_skipped/mcp_config_error."""
+    out = _audit_stream(monkeypatch)
+
+    assert load_mcp_tools(mcp_config)  # the fake server starts
+
+    assert _event_lines(out, "mcp_skipped") == []
+    assert _event_lines(out, "mcp_config_error") == []
 
 
 def test_mcp_tools_sit_behind_the_consent_gate():

@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 from . import __version__
+from .audit import log_event
 from .tools.base import Tool
 
 log = logging.getLogger(__name__)
@@ -220,6 +221,9 @@ def load_mcp_tools(path: Path = CONFIG_FILE) -> list[Tool]:
         return []
     except (json.JSONDecodeError, OSError) as e:
         log.warning("ignoring %s: %s", path, e)
+        # the audit sink is a separate logger with propagate=False, so the
+        # warning above leaves no trace there; name the failure explicitly
+        log_event("mcp_config_error", path=str(path), error_type=type(e).__name__)
         return []
     tools: list[Tool] = []
     for name, spec in (data.get("mcpServers") or {}).items():
@@ -227,6 +231,7 @@ def load_mcp_tools(path: Path = CONFIG_FILE) -> list[Tool]:
             client = MCPClient(name, spec["command"], spec.get("args", []), spec.get("env"))
         except (MCPError, OSError, KeyError, TypeError) as e:
             log.warning("MCP server %r skipped: %s", name, e)
+            log_event("mcp_skipped", name=name, error_type=type(e).__name__)
             continue
         _live_clients.append(client)
         tools.extend(client.tools)
