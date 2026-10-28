@@ -12,8 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from corecoder import audit
-from corecoder import mcp
+from corecoder import audit, mcp
 from corecoder.agent import Agent
 from corecoder.demo import ScriptedLLM
 from corecoder.hooks import Hooks
